@@ -663,16 +663,14 @@ def _attempt(
     try:
         return transport.fetch(url, timeout)
     except KeyboardInterrupt:
+        # Ctrl-C is an instruction from the operator, not an outcome of the request.
         raise
-    except BaseException as exc:
-        # Deliberately broad, and tested to be so: FR-5.1 says one bad request must
-        # never abort a run, which includes failures of our own making (a bug in the
-        # transport raises whatever it likes). Only KeyboardInterrupt is re-raised,
-        # because Ctrl-C is an instruction rather than an outcome.
-        # See TestNoErrorEscapesTheTransport - narrowing this line breaks it.
-        if isinstance(exc, Exception):
-            return FetchResult(ok=False, seconds=now() - start, bytes=0, error=_reason(exc))
-        raise
+    except Exception as exc:
+        # Broad on purpose, and pinned by TestNoErrorEscapesTheTransport: FR-5.1
+        # requires that one bad request never aborts a run, including failures of our
+        # own making - a bug in the transport may raise anything at all. Narrowing
+        # this to network error types reintroduces that crash; the test fails first.
+        return FetchResult(ok=False, seconds=now() - start, bytes=0, error=_reason(exc))
 
 
 def run(

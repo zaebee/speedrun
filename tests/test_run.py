@@ -7,6 +7,8 @@ summary and exit code. Real HTTP is covered separately by the integration test.
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from speedrun import (
@@ -321,3 +323,37 @@ class TestStreamSeparation:
         run("https://x/y", 2, 5.0, t, quiet=False, emit=lines.append)
         assert len(lines) == 2
         assert any("FAILED" in ln for ln in lines)
+
+
+class TestOnlyExceptionsAreContained:
+    """FR-5.1 contains failures of *requests*, not control flow.
+
+    An earlier revision caught BaseException, which swallowed SystemExit raised by a
+    transport and turned a deliberate process exit into one failed request - while
+    KeyboardInterrupt needed an explicit re-raise to escape the same net. Exception is
+    the correct breadth: everything a request can go wrong with, nothing that is an
+    instruction to the process.
+    """
+
+    def test_system_exit_propagates_rather_than_becoming_a_failed_request(self) -> None:
+        class Exits:
+            def fetch(self, url: str, timeout: float) -> FetchResult:
+                raise SystemExit(3)
+
+            def close(self) -> None:
+                return None
+
+        with pytest.raises(SystemExit) as excinfo:
+            _attempt(Exits(), "https://x/y", 5.0, time.monotonic)
+        assert excinfo.value.code == 3
+
+    def test_keyboard_interrupt_still_propagates(self) -> None:
+        class Interrupts:
+            def fetch(self, url: str, timeout: float) -> FetchResult:
+                raise KeyboardInterrupt
+
+            def close(self) -> None:
+                return None
+
+        with pytest.raises(KeyboardInterrupt):
+            _attempt(Interrupts(), "https://x/y", 5.0, time.monotonic)
