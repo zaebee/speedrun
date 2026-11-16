@@ -60,6 +60,31 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.flush()
         server.delay_before_close()
 
+    def _serve_slow_headers(self, server: LocalTestServer) -> None:
+        """Delay BEFORE sending the status line.
+
+        The header phase is a separate blocking operation from body reads; without
+        re-arming the socket before getresponse(), a slow header response could
+        outlive --timeout while every body read stayed inside budget.
+        """
+        server.sleep_before_headers()
+
+    def _serve_trickling_redirect(self, server: LocalTestServer) -> None:
+        """A 302 whose body arrives one byte at a time.
+
+        Exercises the drain path under the deadline: the redirect decision is made
+        immediately, but consuming its body must not be allowed to run past
+        --timeout either.
+        """
+        self.send_response(302)
+        self.send_header("Location", "/final")
+        self.send_header("Content-Length", "2000")
+        self.end_headers()
+        for _ in range(2000):
+            self.wfile.write(b"t")
+            self.wfile.flush()
+            server.tick()
+
     def _serve_stalled(self, server: LocalTestServer) -> None:
         # Headers then silence: exercises the socket timeout, which is a different
         # failure from the whole-request deadline.
@@ -147,6 +172,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 _ROUTES: tuple[tuple[str, str], ...] = (
     ("/slow-eof", "_serve_slow_eof"),
     ("/stalled", "_serve_stalled"),
+    ("/slow-headers", "_serve_slow_headers"),
+    ("/trickle-redirect", "_serve_trickling_redirect"),
     ("/loop", "_serve_loop"),
     ("/redirect-body", "_serve_redirect_body"),
     ("/redirect", "_serve_redirect"),
@@ -188,6 +215,16 @@ class LocalTestServer(socketserver.ThreadingTCPServer):
         import time
 
         time.sleep(30)
+
+    def sleep_before_headers(self) -> None:
+        import time
+
+        time.sleep(2.0)
+
+    def tick(self) -> None:
+        import time
+
+        time.sleep(0.002)
 
     def server_bind(self) -> None:
         super().server_bind()

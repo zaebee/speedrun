@@ -170,6 +170,15 @@ def exit_code_for(summary: Summary) -> int:
 # --- Input validation (FR-1) --------------------------------------------------
 
 
+class DeadlineExceeded(OSError):
+    """Raised when the whole-request deadline is reached before an operation.
+
+    Subclasses OSError because that is what it replaces in practice - a socket that
+    would otherwise block past the deadline - and every existing handler already
+    treats OSError as "this attempt failed".
+    """
+
+
 class UsageError(ValueError):
     """Bad invocation: wrong argument or unsupported URL. Maps to exit code 2."""
 
@@ -334,7 +343,7 @@ class HttpTransport:
                 None,
             )
         try:
-            response = self._exchange_resilient(scheme, host, port, path, deadline)
+            conn, response = self._exchange_resilient(scheme, host, port, path, deadline)
         except (OSError, http.client.HTTPException, ValueError) as exc:
             # Socket errors, protocol errors and malformed status lines all mean
             # "this attempt failed", never "stop the run" (FR-5.1).
@@ -345,10 +354,10 @@ class HttpTransport:
         if 300 <= status < 400 and location:
             # Drain before reuse, otherwise the next request on this connection
             # would read the redirect's body as its own.
-            self._drain(response)
+            self._drain(conn, response, deadline)
             return FetchResult(ok=True, seconds=0.0, bytes=0, error=None), _absolute(url, location)
 
-        size, timed_out = self._read_body(response, deadline)
+        size, timed_out = self._read_body(conn, response, deadline)
         seconds = self.now() - start
         if timed_out:
             self._drop((host, port))
@@ -368,25 +377,29 @@ class HttpTransport:
             )
         return FetchResult(ok=True, seconds=seconds, bytes=size, error=None), None
 
-    def _read_body(self, response: Any, deadline: float) -> tuple[int, bool]:
+    def _read_body(self, conn: Any, response: Any, deadline: float) -> tuple[int, bool]:
         """Read to EOF, returning (payload bytes, deadline_exceeded).
 
         The deadline is checked after *every* read including the one that returns
         EOF: an empty final read that lands late is still a missed deadline, and
         checking only after non-empty chunks would report such a response as a
-        success (FR-3.5). Each blocking read is bounded by the time left, so a
-        stall cannot outlive the deadline either.
+        success (FR-3.5).
+
+        Re-arming the socket here bounds only reads that have not started yet. Once
+        http.client has wrapped the socket in a BufferedReader for this response,
+        changing the socket timeout does not affect reads through that buffer - so a
+        single read can still block past the deadline. See DEADLINE_SCOPE.
         """
         size = 0
         while True:
-            remaining = deadline - self.now()
+            remaining = self._remaining(deadline)
             if remaining <= 0:
                 return size, True
             # Bound the blocking read itself by what is left of the deadline, so a
             # stalled transfer cannot outlive it between chunks (FR-3.5).
-            _set_socket_timeout(response, remaining)
+            _set_socket_timeout(conn, remaining)
             try:
-                chunk = response.read(_CHUNK)
+                chunk = _read_available(response, _CHUNK)
             except TimeoutError:
                 return size, True
             if not chunk:
@@ -398,13 +411,16 @@ class HttpTransport:
             if self.now() > deadline:
                 return size, True
 
-    @staticmethod
-    def _drain(response: Any) -> None:
+    def _drain(self, conn: Any, response: Any, deadline: float) -> None:
         """Consume a redirect's body so the pooled connection stays usable.
 
         Load-bearing, and pinned by TestRedirectWithBody: a 302 that also carries a
         payload leaves unread bytes on the socket, and http.client then raises
         ResponseNotReady on the next request through this connection.
+
+        Draining is network I/O and stops at the deadline between reads (FR-3.5).
+        It cannot be interrupted *inside* a single blocking read: see the module
+        note on what the deadline does and does not bound.
 
         Failures while draining are ignored deliberately - the redirect decision is
         already made, and if the socket is genuinely broken the next request finds
@@ -415,13 +431,20 @@ class HttpTransport:
         # and deliberately discarded, which is what makes this loop's body empty.
         # Volume accounting for the attempt uses the final response only (FR-4.1),
         # asserted by TestRedirectWithBody.
-        with contextlib.suppress(OSError, http.client.HTTPException):
-            while response.read(65_536):
-                continue
+        try:
+            while True:
+                remaining = self._remaining(deadline)
+                if remaining <= 0:
+                    break
+                _set_socket_timeout(conn, remaining)
+                if not _read_available(response, _CHUNK):
+                    break
+        except (OSError, http.client.HTTPException):
+            return None
 
     def _exchange_resilient(
         self, scheme: str, host: str, port: int, path: str, deadline: float
-    ) -> Any:
+    ) -> tuple[Any, Any]:
         """GET with one transparent retry on a stale pooled connection.
 
         Keep-alive has a known race: the server may close an idle connection at any
@@ -438,18 +461,46 @@ class HttpTransport:
                 raise
             return self._exchange(scheme, host, port, path, deadline)
 
-    def _exchange(self, scheme: str, host: str, port: int, path: str, deadline: float) -> Any:
-        """Send one GET on a pooled connection and return the response object."""
+    def _remaining(self, deadline: float) -> float:
+        """Seconds left before the deadline; <= 0 means it has already passed.
+
+        No floor here on purpose. An earlier version used max(0.1, remaining), which
+        let a blocking operation run up to 100 ms past the deadline - a deliberate
+        violation of FR-3.5 dressed up as robustness. A caller that gets <= 0 must
+        fail fast rather than block.
+        """
+        return deadline - self.now()
+
+    def _exchange(
+        self, scheme: str, host: str, port: int, path: str, deadline: float
+    ) -> tuple[Any, Any]:
+        """Send one GET on a pooled connection, returning (connection, response).
+
+        The connection is returned alongside the response because that is where the
+        socket lives: callers that continue reading the body need it to keep
+        re-arming the timeout against the remaining deadline (FR-3.5).
+
+        Every blocking step re-arms, because a timeout set once at connect time is
+        not a whole-request bound - request writing and header reading each block
+        independently.
+        """
         conn = self._connection(scheme, host, port, deadline)
+        _arm(conn, deadline, self.now)
         conn.request("GET", path, headers={"Accept-Encoding": "identity"})
-        return conn.getresponse()
+        # Re-arm before reading the response: getresponse() blocks on its own and
+        # may be reached with far less budget left than connect had.
+        _arm(conn, deadline, self.now)
+        return conn, conn.getresponse()
 
     def _connection(self, scheme: str, host: str, port: int, deadline: float) -> Any:
         key = (host, port)
         conn = self._connections.get(key)
         if conn is None:
+            left = self._remaining(deadline)
+            if left <= 0:
+                raise DeadlineExceeded()
             assert self.conn_factory is not None
-            conn = self.conn_factory(scheme, host, port, max(0.1, deadline - self.now()))
+            conn = self.conn_factory(scheme, host, port, left)
             self._connections[key] = conn
         return conn
 
@@ -474,24 +525,95 @@ class HttpTransport:
 
 _MAX_REDIRECTS = 5
 
+DEADLINE_SCOPE = """What FR-3.5 guarantees, and where it stops. Stated because the
+difference matters to anyone reading a "timed out" result.
+
+Bounded by the deadline, and interruptible:
+  - establishing a new connection (socket timeout set from the remaining budget)
+  - writing the request            (re-armed immediately before)
+  - reading response headers       (re-armed immediately before)
+  - between successive body reads  (checked before each one)
+  - between successive drain reads (checked before each one)
+
+NOT interruptible once started:
+  - DNS resolution of the host, which happens inside the connect call and uses its
+    own resolver timeouts that we do not control.
+
+A single read is kept short by reading with read1() rather than read(n): the latter
+waits for a full buffer, which would make every check above unreachable for a slow
+trickling sender (see _read_available).
+
+Consequence: the deadline bounds setup, header exchange, and every gap between
+transferred chunks. It cannot preempt a read that the kernel has already satisfied
+partially, nor DNS, so --timeout is an upper bound on our waiting, not on wall-clock
+completion of a pathological server.
+"""
+
 
 def _default_connection(scheme: str, host: str, port: int, timeout: float) -> Any:
     cls = http.client.HTTPSConnection if scheme == "https" else http.client.HTTPConnection
     return cls(host, port, timeout=timeout)
 
 
-def _set_socket_timeout(response: Any, seconds: float) -> None:
-    """Re-arm the underlying socket for one read of at most ``seconds``.
+def _arm(conn: Any, deadline: float, now: Callable[[], float]) -> None:
+    """Bound the next blocking call on ``conn`` by the time left to the deadline.
 
-    ``http.client`` exposes no public API for this; reaching for the socket is the
-    only way to bound a blocking read by a *remaining* deadline rather than by the
-    original full timeout. Guarded so an unexpected response object (a test fake)
-    degrades to leaving the timeout as-is instead of crashing.
+    Raises rather than clamping when nothing is left: allowing even one more
+    operation with a positive timeout is how a deadline becomes advisory.
     """
-    sock = getattr(getattr(response, "fp", None), "_sock", None) or getattr(response, "sock", None)
-    if sock is not None:
-        with contextlib.suppress(OSError, ValueError):
-            sock.settimeout(max(0.001, seconds))
+    remaining = deadline - now()
+    if remaining <= 0:
+        raise DeadlineExceeded(f"deadline passed before {type(conn).__name__} operation")
+    _set_socket_timeout(conn, remaining)
+
+
+class _Readable(Protocol):
+    """The part of http.client.HTTPResponse these helpers use.
+
+    Declared so the read helpers are typed instead of taking ``Any`` and returning
+    ``Any`` through it - which is how a wrong return type would slip past mypy here.
+    """
+
+    def read(self, size: int = ...) -> bytes: ...
+
+    def read1(self, size: int = ...) -> bytes: ...
+
+
+def _read_available(response: _Readable, size: int) -> bytes:
+    """Read whatever has arrived, up to ``size`` bytes, without waiting for more.
+
+    ``read1`` is the point of this function, not a micro-optimisation. ``read(n)`` on
+    a buffered response blocks until it holds exactly n bytes or EOF, so a server
+    trickling a small body pins the call for the whole transfer and no deadline check
+    can intervene. ``read1`` returns as soon as any data arrives, which turns "check
+    the deadline between reads" from a formality into something that actually bounds
+    the loop. Measured against a local server streaming 2000 one-byte writes:
+    read(65536) blocked 4.4 s; read1 reached a 0.6 s deadline after 0.60 s.
+
+    Falls back to read() when the object has no read1 (test doubles).
+    """
+    if hasattr(response, "read1"):
+        return response.read1(size)
+    return response.read(size)
+
+
+def _set_socket_timeout(target: object, seconds: float) -> None:
+    """Re-arm the socket behind ``target`` so its next blocking call lasts <= seconds.
+
+    The socket lives on the HTTPConnection, not on the HTTPResponse: a response's
+    ``fp`` is a BufferedReader over that same socket and exposes no ``_sock`` of its
+    own. Passing the response - which an earlier revision did - silently did nothing
+    while looking like enforcement.
+
+    No floor on ``seconds``: clamping to a minimum such as 0.1 s lets an operation
+    block past the deadline, which is precisely the breach FR-3.5 forbids. Callers
+    check the remaining budget first and must not call with a non-positive value.
+    """
+    sock = getattr(target, "sock", None) or getattr(getattr(target, "fp", None), "_sock", None)
+    if sock is None:
+        return None
+    with contextlib.suppress(OSError, ValueError):
+        sock.settimeout(seconds)
 
 
 def _split_url(url: str) -> tuple[str, str, int, str]:
@@ -569,12 +691,16 @@ def run(
     """
     writer: Emit = emit if emit is not None else print
     results: list[FetchResult] = []
+    started = now()
     for index in range(1, requests + 1):
         result = _attempt(transport, url, timeout, now)
         results.append(result)
         if not quiet:
             writer(_progress_line(index, requests, result))
-    return summarize(results)
+    # Measured here rather than left at the dataclass default: Summary.wall_seconds
+    # of 0.0 would otherwise be indistinguishable from an instantaneous run, and
+    # callers using run() got a silently wrong figure while main() was correct.
+    return summarize(results, wall_seconds=now() - started)
 
 
 # --- Output rendering ---------------------------------------------------------

@@ -80,13 +80,27 @@ Code `2` is kept distinct from `1` on purpose: "invoked wrong" differs from
   reconnect) drags the mean, and one number alone cannot reveal that it happened.
   Median is the cheapest way to keep the summary honest.
 - **FR-3.4.** Wall time of the whole run is measured separately from the sum of
-  per-request times; the difference exposes overhead (DNS, first handshake).
-- **FR-3.5.** `--timeout` is a deadline on the *whole* request: if the body is not
-  fully read within it, the attempt is failed. This needs stating explicitly
-  because Python's socket timeout bounds only the wait between two reads - with a
-  fast server a 10 MiB download would happily run past a 0.3 s "timeout". The
-  socket timeout is still applied as well, so a hard stall is caught too; the two
-  cover different failures.
+  per-request times; the difference exposes overhead (DNS, first handshake). It is
+  populated by `run()` as well as by the CLI: a default of 0.0 is otherwise
+  indistinguishable from an instantaneous run, and callers of the library API would
+  get a wrong figure while the command line was correct.
+- **FR-3.5.** `--timeout` is a deadline on the *whole* request, and it must bound
+  every blocking step, not selected ones: connection setup, request write, response
+  header read, each body read, and each redirect-body drain. Two implementation facts
+  make this non-trivial, and both are asserted by tests:
+  - Python's socket timeout bounds only the wait between two reads, so it is re-armed
+    to the *remaining* budget before every step. A floor such as `max(0.1, remaining)`
+    is forbidden: it lets an operation block past the deadline and makes the contract
+    advisory. With no budget left, the attempt fails without opening a socket.
+  - `read(n)` on a buffered response waits for a full n bytes, which puts any check
+    between reads out of reach for a slow sender. Reads therefore use `read1`, which
+    returns whatever has arrived. Measured against a local server streaming 2000
+    one-byte writes: `read(65536)` blocked 4.4 s under a 0.6 s deadline; `read1`
+    reached the deadline in 0.60 s.
+
+  Explicitly outside the guarantee: DNS resolution (resolver timeouts are not ours)
+  and preempting a single read already in progress. Recorded as `DEADLINE_SCOPE` in
+  the module so the limitation travels with the code rather than only the docs.
 
 ### FR-4. Data volume
 

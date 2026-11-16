@@ -239,9 +239,43 @@ class TestExceptionDurationsAreReal:
 class TestWallClockIsIndependent:
     """P2-3 / FR-3.4: run wall time is its own metric, not a sum of durations."""
 
-    def test_summary_exposes_wall_seconds(self) -> None:
-        s = summarize([ok(1.0, 10)])
-        assert hasattr(s, "wall_seconds")
+    def test_summarize_defaults_wall_to_zero_when_not_measured(self) -> None:
+        # Documents the default so a caller cannot mistake it for a measurement.
+        assert summarize([ok(1.0, 10)]).wall_seconds == 0.0
+
+    def test_summarize_carries_the_wall_time_it_is_given(self) -> None:
+        # The earlier version of this check was hasattr(s, "wall_seconds"), which is
+        # true whether or not anything measured - it proved the field exists, not that
+        # the number means anything.
+        assert summarize([ok(1.0, 10)], wall_seconds=4.25).wall_seconds == 4.25
+
+    def test_run_measures_its_own_wall_time(self) -> None:
+        """FR-3.4 through run(), not just main(): the public API must agree with the CLI.
+
+        A transport whose fetch advances an injected clock by 1 s per request, plus a
+        gap charged to close(), gives wall > sum-of-durations and both non-zero.
+        """
+        state = {"t": 0.0}
+
+        class Gappy:
+            def fetch(self, url: str, timeout: float) -> FetchResult:
+                state["t"] += 1.0
+                return ok(0.5, 100)
+
+            def close(self) -> None:
+                state["t"] += 3.0
+
+        s = run(
+            "https://x/y",
+            requests=2,
+            timeout=9.0,
+            transport=Gappy(),
+            quiet=True,
+            now=lambda: state["t"],
+        )
+        assert s.total_seconds == pytest.approx(1.0)  # two 0.5 s requests
+        assert s.wall_seconds == pytest.approx(2.0)  # only the request phase ran
+        assert s.wall_seconds > s.total_seconds
 
     def test_main_reports_wall_time_above_request_sum(
         self, capsys: pytest.CaptureFixture[str]

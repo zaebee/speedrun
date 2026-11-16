@@ -53,11 +53,28 @@ class StubResponse:
         return b""
 
 
+class StubSocket:
+    """Records every timeout the transport arms, so re-arming is observable.
+
+    Without this the deadline logic could call settimeout with the original full
+    value every time and no test would notice - which is exactly the bug found in
+    the real code, where the timeout was being set on the response instead of the
+    connection and therefore did nothing at all.
+    """
+
+    def __init__(self) -> None:
+        self.timeouts: list[float] = []
+
+    def settimeout(self, seconds: float) -> None:
+        self.timeouts.append(seconds)
+
+
 class StubConnection:
     def __init__(self, responses: list[StubResponse]) -> None:
         self.responses = list(responses)
         self.requests: list[tuple[str, str]] = []
         self.closed = 0
+        self.sock = StubSocket()
 
     def request(self, method: str, path: str, headers: object = None) -> None:
         self.requests.append((method, path))

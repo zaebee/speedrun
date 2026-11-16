@@ -219,3 +219,73 @@ class TestRedirectWithBody:
         assert second.bytes == 100
         # And both still share one connection.
         assert server.accepted_connections == 1
+
+
+class TestDeadlineCoversEveryPhase:
+    """FR-3.5: the deadline bounds connect, request write, header read, body read
+    and redirect drain - not only the phases that happened to be checked.
+
+    Each case sets a short timeout against a server phase that would take longer,
+    and asserts both the outcome (failed) and the timing (stopped near the
+    deadline rather than after the phase completed).
+    """
+
+    def test_slow_response_headers_are_bounded(self, server: LocalTestServer) -> None:
+        import time
+
+        transport = HttpTransport()
+        started = time.monotonic()
+        try:
+            result = transport.fetch(f"{server.base_url}/slow-headers", timeout=0.4)
+        finally:
+            transport.close()
+        elapsed = time.monotonic() - started
+        assert result.ok is False
+        # Server delays 2 s before headers; the deadline must cut it near 0.4 s.
+        assert elapsed < 1.2, f"header phase outlived the deadline: {elapsed:.2f}s"
+
+    def test_trickle_drain_stops_at_the_deadline_between_reads(
+        self, server: LocalTestServer
+    ) -> None:
+        """Draining checks the deadline before each read; it cannot abort one in flight.
+
+        The body arrives as 2000 single-byte writes, so there are thousands of
+        decision points and the loop stops close to the budget. A hard cap on a
+        single blocking read is explicitly out of scope (DEADLINE_SCOPE).
+        """
+        import time
+
+        transport = HttpTransport()
+        started = time.monotonic()
+        try:
+            result = transport.fetch(f"{server.base_url}/trickle-redirect", timeout=0.6)
+        finally:
+            transport.close()
+        elapsed = time.monotonic() - started
+        assert elapsed < 1.5, f"drain ignored the deadline between reads: {elapsed:.2f}s"
+        assert result.ok is False or result.bytes == 0
+
+    def test_no_budget_left_opens_no_socket(self, server: LocalTestServer) -> None:
+        """An attempt starting past its deadline must not touch the network.
+
+        Driven through _fetch_one with an explicit deadline rather than through
+        fetch(timeout=...): fetch computes deadline = now() + timeout, so with any
+        clock there is always exactly `timeout` of budget left and "already expired"
+        cannot be expressed at all. A deadline in the past is what a second redirect
+        hop after a slow first hop actually looks like.
+
+        An earlier max(0.1, remaining) clamp would have opened a socket here and been
+        willing to block 100 ms past the deadline.
+        """
+        accepted_before = server.accepted_connections
+        transport = HttpTransport(now=lambda: 50.0)
+        try:
+            result, redirect = transport._fetch_one(
+                f"{server.base_url}/payload=10", deadline=1.0, start=0.0
+            )
+        finally:
+            transport.close()
+        assert result.ok is False
+        assert "deadline" in (result.error or "")
+        assert redirect is None
+        assert server.accepted_connections == accepted_before

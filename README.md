@@ -124,11 +124,16 @@ The choices below change the numbers, so they are documented rather than hidden:
   declared length, and a declared length can disagree with what arrives.
 - **Body is read in 256 KiB chunks and discarded**, so peak memory stays constant
   regardless of resource size. Verified: downloading a 100 MiB file uses the same
-  ~24 MB RSS as a 10 MiB one.
-- **`--timeout` bounds the whole request.** Python's socket timeout only limits the
-  wait between two reads, which lets a fast server stream far past a short timeout;
-  the deadline is checked during the read loop as well. The socket timeout is still
-  applied, catching hard stalls.
+  identical peak RSS (~33 MB, mostly the interpreter) as a 10 MiB one. Measured by
+  `tests/test_memory.py`, which also asserts both downloads really transferred their
+  full payload — without that check the test passes while downloading nothing.
+- **`--timeout` bounds the whole request.** The deadline is re-armed to the time
+  actually left before every blocking step — connect, request write, response headers,
+  each body read, each redirect drain — because a timeout set once at connect time is
+  not a whole-request bound. Body reads use `read1()` rather than `read(n)`: the latter
+  waits for a full buffer, which puts the between-read checks out of reach for a slow
+  sender. Not covered: DNS resolution (resolver timeouts are not ours) and preempting a
+  single read already in progress.
 - **Redirects are followed** (up to 5 hops) and the *final* response status decides
   success. A redirect ending in 404 fails; a CDN answering with a 302 in front of its
   asset measures normally. The hop limit stops a self-referential `Location`.
