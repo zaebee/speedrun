@@ -7,6 +7,7 @@ summary and exit code. Real HTTP is covered separately by the integration test.
 
 from __future__ import annotations
 
+import asyncio
 import time
 
 import pytest
@@ -31,7 +32,7 @@ class FakeTransport(Transport):
         self.script = list(script)
         self.calls: list[tuple[str, float]] = []
 
-    def fetch(self, url: str, timeout: float) -> FetchResult:
+    async def fetch(self, url: str, timeout: float) -> FetchResult:
         self.calls.append((url, timeout))
         item = self.script[len(self.calls) - 1]
         if isinstance(item, Exception):
@@ -180,14 +181,14 @@ class TestExceptionDurationsAreReal:
             return clock["t"]
 
         class SlowFail:
-            def fetch(self, url: str, timeout: float) -> FetchResult:
+            async def fetch(self, url: str, timeout: float) -> FetchResult:
                 clock["t"] += 12.5
                 raise ConnectionError("reset by peer")
 
             def close(self) -> None:
                 return None
 
-        result = _attempt(SlowFail(), "https://x/y", 30.0, now)
+        result = asyncio.run(_attempt(SlowFail(), "https://x/y", 30.0, now))
         assert result.ok is False
         assert result.seconds == pytest.approx(12.5)
         assert "ConnectionError" in (result.error or "")
@@ -202,7 +203,7 @@ class TestExceptionDurationsAreReal:
             def __init__(self, delay: float) -> None:
                 self.delay = delay
 
-            def fetch(self, url: str, timeout: float) -> FetchResult:
+            async def fetch(self, url: str, timeout: float) -> FetchResult:
                 clock["t"] += self.delay
                 raise TimeoutError("stalled")
 
@@ -228,14 +229,14 @@ class TestExceptionDurationsAreReal:
         import time as _time
 
         class Sleeping:
-            def fetch(self, url: str, timeout: float) -> FetchResult:
-                _time.sleep(0.05)
+            async def fetch(self, url: str, timeout: float) -> FetchResult:
+                await asyncio.sleep(0.05)
                 raise TimeoutError("slow failure")
 
             def close(self) -> None:
                 return None
 
-        result = _attempt(Sleeping(), "https://x/y", 30.0, _time.monotonic)
+        result = asyncio.run(_attempt(Sleeping(), "https://x/y", 30.0, _time.monotonic))
         assert result.ok is False
         assert result.seconds >= 0.04  # measured, not fabricated
 
@@ -262,7 +263,7 @@ class TestWallClockIsIndependent:
         state = {"t": 0.0}
 
         class Gappy:
-            def fetch(self, url: str, timeout: float) -> FetchResult:
+            async def fetch(self, url: str, timeout: float) -> FetchResult:
                 state["t"] += 1.0
                 return ok(0.5, 100)
 
@@ -293,7 +294,7 @@ class TestWallClockIsIndependent:
             def __init__(self) -> None:
                 self.n = 0
 
-            def fetch(self, url: str, timeout: float) -> FetchResult:
+            async def fetch(self, url: str, timeout: float) -> FetchResult:
                 self.n += 1
                 if self.n > 1:
                     _time.sleep(0.05)  # cost incurred before the timed request
@@ -339,7 +340,7 @@ class TestOnlyExceptionsAreContained:
 
     def test_system_exit_propagates_rather_than_becoming_a_failed_request(self) -> None:
         class Exits:
-            def fetch(self, url: str, timeout: float) -> FetchResult:
+            async def fetch(self, url: str, timeout: float) -> FetchResult:
                 raise SystemExit(3)
 
             def close(self) -> None:
@@ -347,13 +348,13 @@ class TestOnlyExceptionsAreContained:
 
         transport = Exits()
         with pytest.raises(SystemExit) as excinfo:
-            _attempt(transport, "https://x/y", 5.0, time.monotonic)
+            asyncio.run(_attempt(transport, "https://x/y", 5.0, time.monotonic))
         # The exit code must survive intact, not be converted into a failed request.
         assert excinfo.value.code == 3
 
     def test_keyboard_interrupt_still_propagates(self) -> None:
         class Interrupts:
-            def fetch(self, url: str, timeout: float) -> FetchResult:
+            async def fetch(self, url: str, timeout: float) -> FetchResult:
                 raise KeyboardInterrupt
 
             def close(self) -> None:
@@ -361,4 +362,4 @@ class TestOnlyExceptionsAreContained:
 
         transport = Interrupts()
         with pytest.raises(KeyboardInterrupt):
-            _attempt(transport, "https://x/y", 5.0, time.monotonic)
+            asyncio.run(_attempt(transport, "https://x/y", 5.0, time.monotonic))

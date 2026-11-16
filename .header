@@ -1,0 +1,26 @@
+"""Transport behaviour against a local HTTP server we control.
+
+Only what needs real sockets lives here: connection-reuse counting, deadline
+enforcement on each blocking phase over actual TCP, and pool recovery after an
+abandoned transfer. Status codes, redirects and byte accounting are covered by
+test_transport.py through HTTPX's MockTransport.
+
+Everything here runs offline and deterministically.
+"""
+
+from __future__ import annotations
+
+import asyncio
+
+import pytest
+
+from local_server import LocalTestServer
+from speedrun import FetchResult, HttpTransport, run
+
+
+@pytest.fixture
+def server() -> LocalTestServer:
+    with LocalTestServer() as s:
+        yield s
+
+

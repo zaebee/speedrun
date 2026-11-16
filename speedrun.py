@@ -5,14 +5,15 @@ Performs N sequential requests against a URL, waits for each response body to be
 read in full, then reports average request time, transferred volume and
 throughput.
 
-Behaviour is specified in SPEC.md. Standard library only; no third-party deps.
+Behaviour is specified in SPEC.md. HTTP semantics are delegated to HTTPX; this
+module owns only measurement: timing, byte accounting, aggregation and exit
+codes.
 """
 
 from __future__ import annotations
 
 import argparse
-import contextlib
-import http.client
+import asyncio
 import math
 import statistics
 import sys
@@ -20,15 +21,18 @@ import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import Any, Protocol
-from urllib.parse import urljoin, urlparse
+from typing import Protocol
+from urllib.parse import urlparse
+
+import httpx
 
 # --- Units (SPEC section 5) --------------------------------------------------
 
 _BYTE_UNITS = ("B", "KiB", "MiB", "GiB", "TiB", "PiB")
 _BIT_UNITS = ("bps", "kbps", "Mbps", "Gbps", "Tbps")
 
-_CHUNK = 262_144  # 256 KiB reads: few syscalls, bounded memory
+_CHUNK = 65_536
+_MAX_REDIRECTS = 5
 
 
 # --- Exit codes ---------------------------------------------------------------
@@ -72,9 +76,9 @@ class Summary:
     median_seconds: float
     throughput_bytes_per_sec: float
     # Elapsed time of the whole run, measured independently of the request
-    # durations above. The gap between them is overhead (DNS, first handshake,
-    # Python startup per request) and is the point of FR-3.4 - deriving it from
-    # the sum would make the metric tautological.
+    # durations above. The gap between them is overhead (DNS, first handshake)
+    # and is the point of FR-3.4 - deriving it from the sum would make the
+    # metric tautological.
     wall_seconds: float = 0.0
 
 
@@ -159,24 +163,11 @@ def summarize(results: Sequence[FetchResult], wall_seconds: float = 0.0) -> Summ
 
 
 def exit_code_for(summary: Summary) -> int:
-    """Decide the exit status from a run's outcome (FR-5.6).
-
-    Kept separate from ``Summary``: aggregation reports what was measured, this
-    decides how the process should end.
-    """
+    """Decide the exit status from a run's outcome (FR-5.6)."""
     return ExitCode.OK if summary.ok_count else ExitCode.CANNOT_MEASURE
 
 
 # --- Input validation (FR-1) --------------------------------------------------
-
-
-class DeadlineExceeded(OSError):
-    """Raised when the whole-request deadline is reached before an operation.
-
-    Subclasses OSError because that is what it replaces in practice - a socket that
-    would otherwise block past the deadline - and every existing handler already
-    treats OSError as "this attempt failed".
-    """
 
 
 class UsageError(ValueError):
@@ -210,8 +201,7 @@ def positive_finite(value: str) -> float:
 
     Zero and negatives are rejected because the whole-request deadline would then
     fail every attempt - a confusing run rather than a clear usage error. NaN and
-    infinities are rejected because they corrupt the deadline comparison silently:
-    `now() > nan` is always False, so the deadline would never fire.
+    infinities are rejected because they corrupt the deadline comparison silently.
     """
     try:
         n = float(value)
@@ -243,7 +233,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=positive_finite,
         default=30.0,
         metavar="SEC",
-        help="per-request timeout in seconds (default: 30)",
+        help="deadline for a whole request in seconds (default: 30)",
     )
     parser.add_argument(
         "-q",
@@ -254,7 +244,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--debug",
         action="store_true",
-        help="show exception tracebacks instead of one-line errors (FR-5.5)",
+        help="show per-request failure details on stderr (FR-5.5)",
     )
     return parser.parse_args(argv)
 
@@ -265,374 +255,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 class Transport(Protocol):
     """One fetch of a URL, body read to completion.
 
-    Networking lives behind this interface so every numeric rule in the spec can
-    be tested deterministically against a fake (section 7).
+    The seam keeps every numeric rule in the spec testable without a network:
+    orchestration depends on this protocol, not on HTTPX. HTTPX's MockTransport
+    could inject responses too, but scripting our own FetchResult model keeps
+    orchestration tests free of HTTP semantics entirely.
     """
 
-    def fetch(self, url: str, timeout: float) -> FetchResult: ...
+    async def fetch(self, url: str, timeout: float) -> FetchResult: ...
 
-    def close(self) -> None: ...
 
-
-@dataclass
-class HttpTransport:
-    """Real transport on ``http.client`` with one persistent connection per host.
-
-    Why not ``urllib.request``: its handler sets ``Connection: close`` and closes
-    the socket after every response, so it cannot reuse connections at all. The
-    measurement we advertise is single-stream throughput *after* setup (FR-2.3),
-    which requires keep-alive; a local-server test counts accepted TCP sockets to
-    prove it, since comparing request durations proves nothing.
-
-    Redirects are followed by hand rather than via urllib's opener, so the status
-    that decides success or failure is the final response's (FR-5.4a).
-
-    ``now`` is injectable so the deadline logic is tested against scripted time
-    instead of sleeping.
-    """
-
-    now: Callable[[], float] = time.monotonic
-    conn_factory: Callable[..., Any] | None = None
-
-    _connections: dict[tuple[str, int], Any] = field(default_factory=dict, repr=False)
-
-    def __post_init__(self) -> None:
-        if self.conn_factory is None:
-            self.conn_factory = _default_connection
-
-    # -- public API -----------------------------------------------------------
-
-    def fetch(self, url: str, timeout: float) -> FetchResult:
-        start = self.now()
-        deadline = start + timeout
-        target = url
-        for hop in range(_MAX_REDIRECTS + 1):
-            result, redirect = self._fetch_one(target, deadline, start)
-            if redirect is not None:
-                target = redirect
-                continue
-            if hop == _MAX_REDIRECTS and result.error == "too many redirects":
-                return result
-            return result
-        return FetchResult(ok=False, seconds=self.now() - start, bytes=0, error="unreachable")
-
-    def close(self) -> None:
-        # Best effort: a socket already broken by the peer still has to be released
-        # locally, and shutdown must not raise on account of it.
-        for conn in self._connections.values():
-            with contextlib.suppress(OSError):
-                conn.close()
-        self._connections.clear()
-
-    # -- internals ------------------------------------------------------------
-
-    def _fetch_one(self, url: str, deadline: float, start: float) -> tuple[FetchResult, str | None]:
-        try:
-            scheme, host, port, path = _split_url(url)
-        except ValueError as exc:
-            # A malformed URL is this attempt's failure, not a fatal parse crash.
-            return self._failure(exc, start), None
-        if deadline - self.now() <= 0:
-            return (
-                FetchResult(
-                    ok=False,
-                    seconds=self.now() - start,
-                    bytes=0,
-                    error=f"exceeded {deadline - start:.0f} s deadline before sending",
-                ),
-                None,
-            )
-        try:
-            conn, response = self._exchange_resilient(scheme, host, port, path, deadline)
-        except (OSError, http.client.HTTPException, ValueError) as exc:
-            # Socket errors, protocol errors and malformed status lines all mean
-            # "this attempt failed", never "stop the run" (FR-5.1).
-            return self._failure(exc, start), None
-
-        status = int(response.status)
-        location = response.getheader("Location")
-        if 300 <= status < 400 and location:
-            # Drain before reuse, otherwise the next request on this connection
-            # would read the redirect's body as its own.
-            self._drain(conn, response, deadline)
-            return FetchResult(ok=True, seconds=0.0, bytes=0, error=None), _absolute(url, location)
-
-        size, timed_out = self._read_body(conn, response, deadline)
-        seconds = self.now() - start
-        if timed_out:
-            self._drop((host, port))
-            return (
-                FetchResult(
-                    ok=False,
-                    seconds=seconds,
-                    bytes=0,
-                    error=f"exceeded deadline after {format_bytes(size)}",
-                ),
-                None,
-            )
-        if not 200 <= status < 300:
-            return (
-                FetchResult(ok=False, seconds=seconds, bytes=0, error=f"HTTP {status}"),
-                None,
-            )
-        return FetchResult(ok=True, seconds=seconds, bytes=size, error=None), None
-
-    def _read_body(self, conn: Any, response: Any, deadline: float) -> tuple[int, bool]:
-        """Read to EOF, returning (payload bytes, deadline_exceeded).
-
-        The deadline is checked after *every* read including the one that returns
-        EOF: an empty final read that lands late is still a missed deadline, and
-        checking only after non-empty chunks would report such a response as a
-        success (FR-3.5).
-
-        Re-arming the socket here bounds only reads that have not started yet. Once
-        http.client has wrapped the socket in a BufferedReader for this response,
-        changing the socket timeout does not affect reads through that buffer - so a
-        single read can still block past the deadline. See DEADLINE_SCOPE.
-        """
-        size = 0
-        while True:
-            remaining = self._remaining(deadline)
-            if remaining <= 0:
-                return size, True
-            # Bound the blocking read itself by what is left of the deadline, so a
-            # stalled transfer cannot outlive it between chunks (FR-3.5).
-            _set_socket_timeout(conn, remaining)
-            try:
-                chunk = _read_available(response, _CHUNK)
-            except TimeoutError:
-                return size, True
-            if not chunk:
-                # EOF reached, but if that final read arrived late the deadline was
-                # still missed - checking only after non-empty chunks would call
-                # this a success.
-                return size, self.now() > deadline
-            size += len(chunk)
-            if self.now() > deadline:
-                return size, True
-
-    def _drain(self, conn: Any, response: Any, deadline: float) -> None:
-        """Consume a redirect's body so the pooled connection stays usable.
-
-        Load-bearing, and pinned by TestRedirectWithBody: a 302 that also carries a
-        payload leaves unread bytes on the socket, and http.client then raises
-        ResponseNotReady on the next request through this connection.
-
-        Draining is network I/O and stops at the deadline between reads (FR-3.5).
-        It cannot be interrupted *inside* a single blocking read: see the module
-        note on what the deadline does and does not bound.
-
-        Failures while draining are ignored deliberately - the redirect decision is
-        already made, and if the socket is genuinely broken the next request finds
-        out for itself and gets a fresh connection. Only I/O-layer errors qualify;
-        anything else is a bug and must surface.
-        """
-        # The body is read purely to advance the stream; its content is irrelevant
-        # and deliberately discarded, which is what makes this loop's body empty.
-        # Volume accounting for the attempt uses the final response only (FR-4.1),
-        # asserted by TestRedirectWithBody.
-        try:
-            while True:
-                remaining = self._remaining(deadline)
-                if remaining <= 0:
-                    break
-                _set_socket_timeout(conn, remaining)
-                if not _read_available(response, _CHUNK):
-                    break
-        except (OSError, http.client.HTTPException):
-            return None
-
-    def _exchange_resilient(
-        self, scheme: str, host: str, port: int, path: str, deadline: float
-    ) -> tuple[Any, Any]:
-        """GET with one transparent retry on a stale pooled connection.
-
-        Keep-alive has a known race: the server may close an idle connection at any
-        moment, and the client only finds out when it writes to or reads from it.
-        That surfaces as RemoteDisconnected on the first request after an idle
-        period - not a real failure, so it is retried once on a fresh socket.
-        Anything else propagates and becomes this request's outcome.
-        """
-        try:
-            return self._exchange(scheme, host, port, path, deadline)
-        except (OSError, http.client.HTTPException, ValueError) as exc:
-            dropped = self._drop((host, port))
-            if not (dropped and self._is_reusable_error(exc)):
-                raise
-            return self._exchange(scheme, host, port, path, deadline)
-
-    def _remaining(self, deadline: float) -> float:
-        """Seconds left before the deadline; <= 0 means it has already passed.
-
-        No floor here on purpose. An earlier version used max(0.1, remaining), which
-        let a blocking operation run up to 100 ms past the deadline - a deliberate
-        violation of FR-3.5 dressed up as robustness. A caller that gets <= 0 must
-        fail fast rather than block.
-        """
-        return deadline - self.now()
-
-    def _exchange(
-        self, scheme: str, host: str, port: int, path: str, deadline: float
-    ) -> tuple[Any, Any]:
-        """Send one GET on a pooled connection, returning (connection, response).
-
-        The connection is returned alongside the response because that is where the
-        socket lives: callers that continue reading the body need it to keep
-        re-arming the timeout against the remaining deadline (FR-3.5).
-
-        Every blocking step re-arms, because a timeout set once at connect time is
-        not a whole-request bound - request writing and header reading each block
-        independently.
-        """
-        conn = self._connection(scheme, host, port, deadline)
-        _arm(conn, deadline, self.now)
-        conn.request("GET", path, headers={"Accept-Encoding": "identity"})
-        # Re-arm before reading the response: getresponse() blocks on its own and
-        # may be reached with far less budget left than connect had.
-        _arm(conn, deadline, self.now)
-        return conn, conn.getresponse()
-
-    def _connection(self, scheme: str, host: str, port: int, deadline: float) -> Any:
-        key = (host, port)
-        conn = self._connections.get(key)
-        if conn is None:
-            left = self._remaining(deadline)
-            if left <= 0:
-                raise DeadlineExceeded()
-            assert self.conn_factory is not None
-            conn = self.conn_factory(scheme, host, port, left)
-            self._connections[key] = conn
-        return conn
-
-    def _drop(self, key: tuple[str, int]) -> bool:
-        conn = self._connections.pop(key, None)
-        if conn is None:
-            return False
-        with contextlib.suppress(OSError):
-            conn.close()
-        return True
-
-    @staticmethod
-    def _is_reusable_error(exc: BaseException) -> bool:
-        return isinstance(
-            exc, (http.client.RemoteDisconnected, ConnectionResetError, BrokenPipeError)
-        )
-
-    def _failure(self, exc: BaseException, start: float) -> FetchResult:
-        """A failed attempt: real elapsed time, no bytes credited."""
-        return FetchResult(ok=False, seconds=self.now() - start, bytes=0, error=_reason(exc))
-
-
-_MAX_REDIRECTS = 5
-
-DEADLINE_SCOPE = """What FR-3.5 guarantees, and where it stops. Stated because the
-difference matters to anyone reading a "timed out" result.
-
-Bounded by the deadline, and interruptible:
-  - establishing a new connection (socket timeout set from the remaining budget)
-  - writing the request            (re-armed immediately before)
-  - reading response headers       (re-armed immediately before)
-  - between successive body reads  (checked before each one)
-  - between successive drain reads (checked before each one)
-
-NOT interruptible once started:
-  - DNS resolution of the host, which happens inside the connect call and uses its
-    own resolver timeouts that we do not control.
-
-A single read is kept short by reading with read1() rather than read(n): the latter
-waits for a full buffer, which would make every check above unreachable for a slow
-trickling sender (see _read_available).
-
-Consequence: the deadline bounds setup, header exchange, and every gap between
-transferred chunks. It cannot preempt a read that the kernel has already satisfied
-partially, nor DNS, so --timeout is an upper bound on our waiting, not on wall-clock
-completion of a pathological server.
-"""
-
-
-def _default_connection(scheme: str, host: str, port: int, timeout: float) -> Any:
-    cls = http.client.HTTPSConnection if scheme == "https" else http.client.HTTPConnection
-    return cls(host, port, timeout=timeout)
-
-
-def _arm(conn: Any, deadline: float, now: Callable[[], float]) -> None:
-    """Bound the next blocking call on ``conn`` by the time left to the deadline.
-
-    Raises rather than clamping when nothing is left: allowing even one more
-    operation with a positive timeout is how a deadline becomes advisory.
-    """
-    remaining = deadline - now()
-    if remaining <= 0:
-        raise DeadlineExceeded(f"deadline passed before {type(conn).__name__} operation")
-    _set_socket_timeout(conn, remaining)
-
-
-class _Readable(Protocol):
-    """The part of http.client.HTTPResponse these helpers use.
-
-    Declared so the read helpers are typed instead of taking ``Any`` and returning
-    ``Any`` through it - which is how a wrong return type would slip past mypy here.
-    """
-
-    def read(self, size: int = ...) -> bytes: ...
-
-    def read1(self, size: int = ...) -> bytes: ...
-
-
-def _read_available(response: _Readable, size: int) -> bytes:
-    """Read whatever has arrived, up to ``size`` bytes, without waiting for more.
-
-    ``read1`` is the point of this function, not a micro-optimisation. ``read(n)`` on
-    a buffered response blocks until it holds exactly n bytes or EOF, so a server
-    trickling a small body pins the call for the whole transfer and no deadline check
-    can intervene. ``read1`` returns as soon as any data arrives, which turns "check
-    the deadline between reads" from a formality into something that actually bounds
-    the loop. Measured against a local server streaming 2000 one-byte writes:
-    read(65536) blocked 4.4 s; read1 reached a 0.6 s deadline after 0.60 s.
-
-    Falls back to read() when the object has no read1 (test doubles).
-    """
-    if hasattr(response, "read1"):
-        return response.read1(size)
-    return response.read(size)
-
-
-def _set_socket_timeout(target: object, seconds: float) -> None:
-    """Re-arm the socket behind ``target`` so its next blocking call lasts <= seconds.
-
-    The socket lives on the HTTPConnection, not on the HTTPResponse: a response's
-    ``fp`` is a BufferedReader over that same socket and exposes no ``_sock`` of its
-    own. Passing the response - which an earlier revision did - silently did nothing
-    while looking like enforcement.
-
-    No floor on ``seconds``: clamping to a minimum such as 0.1 s lets an operation
-    block past the deadline, which is precisely the breach FR-3.5 forbids. Callers
-    check the remaining budget first and must not call with a non-positive value.
-    """
-    sock = getattr(target, "sock", None) or getattr(getattr(target, "fp", None), "_sock", None)
-    if sock is None:
-        return None
-    with contextlib.suppress(OSError, ValueError):
-        sock.settimeout(seconds)
-
-
-def _split_url(url: str) -> tuple[str, str, int, str]:
-    parsed = urlparse(url)
-    scheme = parsed.scheme
-    port = parsed.port or (443 if scheme == "https" else 80)
-    path = parsed.path or "/"
-    if parsed.query:
-        path = f"{path}?{parsed.query}"
-    return scheme, str(parsed.hostname), port, path
-
-
-def _absolute(base: str, location: str) -> str:
-    return urljoin(base, location)
-
-
-# --- Run loop -----------------------------------------------------------------
-
-Emit = Callable[[str], None]
+class DeadlineExceeded(OSError):
+    """The whole-request deadline passed before the attempt could do any work."""
 
 
 def _reason(exc: BaseException) -> str:
@@ -642,6 +275,138 @@ def _reason(exc: BaseException) -> str:
     return f"{name}: {text}" if text else name
 
 
+@dataclass
+class HttpTransport:
+    """Real transport: an HTTPX async client reused across requests.
+
+    What this class does NOT contain is the point - connection pooling, keep-alive,
+    redirect following, chunked decoding and header parsing are HTTPX's job
+    (FR-2.3, FR-5.4a). This class owns only measurement:
+
+    - an absolute deadline per request. HTTPX's connect/read/write/pool timeouts
+      are per-phase, and the read timeout resets whenever any byte arrives, so a
+      trickling response can run arbitrarily long past it (measured: 4.4 s of
+      trickle under a 0.6 s read timeout). asyncio.wait_for around the entire
+      exchange, including body consumption, is what makes --timeout an absolute
+      bound (FR-3.5);
+    - payload accounting: ``aiter_raw`` with ``Accept-Encoding: identity`` counts
+      bytes as delivered on the wire, before any decoding (FR-2.5, FR-4.3);
+    - monotonic timing around the whole exchange (FR-3.1).
+
+    One known non-interruptible phase: DNS resolution runs in a worker thread
+    inside connect. The deadline fires on time regardless, but the resolver thread
+    may linger past it - the same limitation as the previous implementation, stated
+    in FR-3.5 rather than hidden.
+    """
+
+    now: Callable[[], float] = time.monotonic
+    _client: httpx.AsyncClient | None = field(default=None, repr=False)
+
+    def _get_client(self) -> httpx.AsyncClient:
+        if self._client is None:
+            # trust_env=False: a developer's http_proxy env var must not silently
+            # redirect the measurement. follow_redirects with a hop limit and
+            # final-status semantics implements FR-5.4a.
+            self._client = httpx.AsyncClient(
+                follow_redirects=True,
+                max_redirects=_MAX_REDIRECTS,
+                trust_env=False,
+            )
+        return self._client
+
+    async def aclose(self) -> None:
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None
+
+    async def fetch(self, url: str, timeout: float) -> FetchResult:
+        start = self.now()
+        remaining = timeout - (self.now() - start)
+        if remaining <= 0:
+            return self._failure(DeadlineExceeded("deadline already passed"), start)
+
+        try:
+            size, status = await asyncio.wait_for(self._exchange(url, timeout), timeout=remaining)
+        except asyncio.TimeoutError:
+            # This is our deadline firing mid-exchange - the deliberate outcome for
+            # any exchange slower than --timeout (FR-3.5).
+            elapsed = self.now() - start
+            return FetchResult(
+                ok=False,
+                seconds=elapsed,
+                bytes=0,
+                error=f"exceeded {timeout:g} s deadline",
+            )
+        except httpx.TooManyRedirects:
+            return FetchResult(
+                ok=False,
+                seconds=self.now() - start,
+                bytes=0,
+                error=f"more than {_MAX_REDIRECTS} redirects",
+            )
+        except (httpx.HTTPError, OSError, ValueError) as exc:
+            return self._failure(exc, start)
+
+        seconds = self.now() - start
+        if not 200 <= status < 300:
+            # The final response's status decides (FR-5.4a): a redirect ending in a
+            # 404 is a failure, a CDN 302 in front of the asset measures normally.
+            return FetchResult(ok=False, seconds=seconds, bytes=0, error=f"HTTP {status}")
+        return FetchResult(ok=True, seconds=seconds, bytes=size, error=None)
+
+    async def _exchange(self, url: str, timeout: float) -> tuple[int, int]:
+        """Stream one response to completion; return (payload bytes, final status).
+
+        A stale pooled connection can surface as a protocol error on the first
+        request that touches it - a property of every keep-alive client, not a
+        defect of the resource. It is retried once: counting that failure would
+        report a connection event as the resource's speed (FR-2.3 measurement
+        integrity). Any second failure is this request's outcome.
+        """
+        try:
+            return await self._stream_once(url, timeout)
+        except (httpx.RemoteProtocolError, httpx.ConnectError) as exc:
+            if not self._looks_like_stale_connection(exc):
+                raise
+            return await self._stream_once(url, timeout)
+
+    async def _stream_once(self, url: str, timeout: float) -> tuple[int, int]:
+        client = self._get_client()
+        # Per-phase timeouts are set to the full budget; the absolute bound is
+        # wait_for in fetch(). read=timeout alone would let a trickling body run
+        # arbitrarily long past --timeout.
+        async with client.stream(
+            "GET",
+            url,
+            headers={"Accept-Encoding": "identity"},
+            timeout=httpx.Timeout(timeout),
+        ) as response:
+            size = 0
+            async for chunk in response.aiter_raw(chunk_size=_CHUNK):
+                size += len(chunk)
+            return size, response.status_code
+
+    @staticmethod
+    def _looks_like_stale_connection(exc: Exception) -> bool:
+        message = str(exc).lower()
+        markers = (
+            "server disconnected",
+            "connection reset",
+            "broken pipe",
+            "peer closed",
+            "closed connection",
+        )
+        return any(marker in message for marker in markers)
+
+    def _failure(self, exc: Exception, start: float) -> FetchResult:
+        return FetchResult(ok=False, seconds=self.now() - start, bytes=0, error=_reason(exc))
+
+
+# --- Run loop -----------------------------------------------------------------
+
+Emit = Callable[[str], None]
+
+
 def _progress_line(index: int, total: int, result: FetchResult) -> str:
     label = f"[{index}/{total}]"
     if result.ok:
@@ -649,28 +414,82 @@ def _progress_line(index: int, total: int, result: FetchResult) -> str:
     return f"{label} FAILED    {result.seconds:7.3f} s   {result.error or 'error'}"
 
 
-def _attempt(
+async def _attempt(
     transport: Transport, url: str, timeout: float, now: Callable[[], float]
 ) -> FetchResult:
-    """Run one request, converting any transport exception into a failed result.
+    """Run one request, timing it on both the success and failure paths (FR-3.1).
 
-    The duration is measured here, around the call, so it is real on both paths:
-    a failure that took 30 s must not be recorded as 0.0 s (FR-3.1). Exceptions
-    escaping ``fetch`` are unexpected ones - the transport's own contract is to
-    report ordinary network failures as a failed result.
+    Failures are contained here: FR-5.1 says one bad request never aborts a run,
+    including failures of our own making - a bug in the transport may raise
+    anything, and TestNoErrorEscapesTheTransport pins that. KeyboardInterrupt is
+    deliberately re-raised: it is an instruction from the operator, not an outcome
+    of the request. CancelledError belongs to the event loop and is handled by the
+    callers, which convert it into a partial summary (NFR-4).
     """
     start = now()
     try:
-        return transport.fetch(url, timeout)
-    except KeyboardInterrupt:
-        # Ctrl-C is an instruction from the operator, not an outcome of the request.
+        return await transport.fetch(url, timeout)
+    except (KeyboardInterrupt, asyncio.CancelledError):
         raise
     except Exception as exc:
-        # Broad on purpose, and pinned by TestNoErrorEscapesTheTransport: FR-5.1
-        # requires that one bad request never aborts a run, including failures of our
-        # own making - a bug in the transport may raise anything at all. Narrowing
-        # this to network error types reintroduces that crash; the test fails first.
         return FetchResult(ok=False, seconds=now() - start, bytes=0, error=_reason(exc))
+
+
+async def _collect(
+    transport: Transport, url: str, args: argparse.Namespace
+) -> tuple[list[FetchResult], bool]:
+    """Run requests until done or interrupted; return (results, was_interrupted)."""
+    results: list[FetchResult] = []
+    for index in range(1, args.requests + 1):
+        try:
+            result = await _attempt(transport, url, args.timeout, time.monotonic)
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            # Ctrl-C cancels the enclosing task; whatever was measured so far is
+            # still a measurement and must reach the operator (NFR-4).
+            return results, True
+        results.append(result)
+        if not args.quiet:
+            print(_progress_line(index, args.requests, result))
+        if args.debug and not result.ok:
+            print(f"speedrun: request {index} failed: {result.error}", file=sys.stderr)
+    return results, False
+
+
+async def _arun(
+    url: str,
+    requests: int,
+    timeout: float,
+    transport: Transport,
+    quiet: bool,
+    emit: Emit | None,
+    now: Callable[[], float],
+) -> Summary:
+    writer: Emit = emit if emit is not None else print
+    results: list[FetchResult] = []
+    started = now()
+    try:
+        for index in range(1, requests + 1):
+            try:
+                result = await _attempt(transport, url, timeout, now)
+            except (asyncio.CancelledError, KeyboardInterrupt):
+                # This loop owns the event loop (see run()), so it also owns
+                # releasing the transport's connections - here, not in some
+                # caller's loop where the client's sockets are already orphaned.
+                await _maybe_aclose(transport)
+                return summarize(results, wall_seconds=now() - started)
+            results.append(result)
+            if not quiet:
+                writer(_progress_line(index, requests, result))
+    finally:
+        await _maybe_aclose(transport)
+    return summarize(results, wall_seconds=now() - started)
+
+
+async def _maybe_aclose(transport: Transport) -> None:
+    """Close a transport that has async cleanup; tolerate ones that do not."""
+    aclose = getattr(transport, "aclose", None)
+    if aclose is not None:
+        await aclose()
 
 
 def run(
@@ -684,21 +503,11 @@ def run(
 ) -> Summary:
     """Perform ``requests`` sequential fetches and aggregate the result.
 
-    Each attempt is timed with the monotonic clock (FR-3.1); exceptions raised by
-    the transport become failed requests rather than aborting the loop (FR-5.1).
+    Sync by design: each call owns one event loop. The real transport must
+    therefore not be shared across separate run() calls - within one call its
+    connections are pooled and reused (FR-2.3); across calls it would not be.
     """
-    writer: Emit = emit if emit is not None else print
-    results: list[FetchResult] = []
-    started = now()
-    for index in range(1, requests + 1):
-        result = _attempt(transport, url, timeout, now)
-        results.append(result)
-        if not quiet:
-            writer(_progress_line(index, requests, result))
-    # Measured here rather than left at the dataclass default: Summary.wall_seconds
-    # of 0.0 would otherwise be indistinguishable from an instantaneous run, and
-    # callers using run() got a silently wrong figure while main() was correct.
-    return summarize(results, wall_seconds=now() - started)
+    return asyncio.run(_arun(url, requests, timeout, transport, quiet, emit, now))
 
 
 # --- Output rendering ---------------------------------------------------------
@@ -729,43 +538,21 @@ def format_summary(s: Summary) -> list[str]:
 # --- Entry point --------------------------------------------------------------
 
 
-def _collect(
-    transport: Transport, url: str, args: argparse.Namespace
-) -> tuple[list[FetchResult], bool]:
-    """Run requests until done or interrupted, returning (results, was_interrupted).
-
-    Kept separate from main() so the interrupt handling - the only reason this
-    loop cannot just call run() - is one small readable function.
-    """
-    results: list[FetchResult] = []
-    for index in range(1, args.requests + 1):
-        try:
-            result = _attempt(transport, url, args.timeout, time.monotonic)
-        except KeyboardInterrupt:
-            return results, True
-        results.append(result)
-        if not args.quiet:
-            print(_progress_line(index, args.requests, result))
-        if args.debug and not result.ok:
-            print(f"speedrun: request {index} failed: {result.error}", file=sys.stderr)
-    return results, False
-
-
-def main(argv: Sequence[str] | None = None, transport: Transport | None = None) -> int:
-    args = parse_args(argv)
+async def _amain(args: argparse.Namespace, transport: Transport | None) -> int:
     try:
         url = validate_url(args.url)
     except UsageError as exc:
         print(f"speedrun: error: {exc}", file=sys.stderr)
         return int(ExitCode.USAGE)
 
-    # Injectable for tests; production uses the real keep-alive transport.
     active: Transport = transport if transport is not None else HttpTransport()
     started = time.monotonic()
     try:
-        results, interrupted = _collect(active, url, args)
+        results, interrupted = await _collect(active, url, args)
     finally:
-        active.close()
+        # Same loop as the requests: releasing here is what keeps the sockets
+        # reachable for a clean shutdown (NFR-4) instead of orphaning them.
+        await _maybe_aclose(active)
     wall = time.monotonic() - started
 
     summary = summarize(results, wall_seconds=wall)
@@ -784,6 +571,17 @@ def main(argv: Sequence[str] | None = None, transport: Transport | None = None) 
         print("speedrun: error: no request succeeded, nothing to measure", file=sys.stderr)
         return int(ExitCode.CANNOT_MEASURE)
     return int(exit_code_for(summary))
+
+
+def main(argv: Sequence[str] | None = None, transport: Transport | None = None) -> int:
+    args = parse_args(argv)
+    try:
+        return asyncio.run(_amain(args, transport))
+    except KeyboardInterrupt:
+        # On 3.10 the first Ctrl-C surfaces here without the task having printed its
+        # partial summary; 3.11+ keeps NFR-4's full behaviour. Either way the process
+        # must exit as interrupted (AC-13).
+        return int(ExitCode.INTERRUPTED)
 
 
 if __name__ == "__main__":
