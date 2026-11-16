@@ -59,7 +59,8 @@ class TestSummarizeExcludesFailures:
     def test_partial_run_counts_only_successes(self) -> None:
         results = [ok(1.0, 100), fail(), ok(3.0, 300), fail(), fail()]
         s = summarize(results)
-        assert (s.ok_count, s.fail_count) == (2, 3)
+        assert s.ok_count == 2
+        assert s.fail_count == 3
         assert s.total_bytes == 400
         assert s.avg_seconds == pytest.approx(2.0)
 

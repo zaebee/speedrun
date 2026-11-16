@@ -77,13 +77,15 @@ class TestFailureHandling:
         t = FakeTransport([ok(1.0, 100), failed(0.2, "HTTP 404"), ok(1.0, 100)])
         summary = run("https://x/y", requests=3, timeout=5.0, transport=t, quiet=True)
         assert len(t.calls) == 3
-        assert (summary.ok_count, summary.fail_count) == (2, 1)
+        assert summary.ok_count == 2
+        assert summary.fail_count == 1
 
     def test_raised_exception_becomes_a_failed_request(self) -> None:
         # The transport signals hard errors by raising; the loop converts them.
         t = FakeTransport([ConnectionError("name or service not known")])
         summary = run("https://x/y", requests=1, timeout=5.0, transport=t, quiet=True)
-        assert (summary.ok_count, summary.fail_count) == (0, 1)
+        assert summary.ok_count == 0
+        assert summary.fail_count == 1
 
     def test_all_requests_failed_reports_zero_successes(self) -> None:
         # AC-3: 0 ok / N failed, and no division by zero anywhere.
@@ -343,8 +345,10 @@ class TestOnlyExceptionsAreContained:
             def close(self) -> None:
                 return None
 
+        transport = Exits()
         with pytest.raises(SystemExit) as excinfo:
-            _attempt(Exits(), "https://x/y", 5.0, time.monotonic)
+            _attempt(transport, "https://x/y", 5.0, time.monotonic)
+        # The exit code must survive intact, not be converted into a failed request.
         assert excinfo.value.code == 3
 
     def test_keyboard_interrupt_still_propagates(self) -> None:
@@ -355,5 +359,6 @@ class TestOnlyExceptionsAreContained:
             def close(self) -> None:
                 return None
 
+        transport = Interrupts()
         with pytest.raises(KeyboardInterrupt):
-            _attempt(Interrupts(), "https://x/y", 5.0, time.monotonic)
+            _attempt(transport, "https://x/y", 5.0, time.monotonic)

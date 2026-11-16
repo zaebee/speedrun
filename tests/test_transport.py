@@ -130,7 +130,7 @@ class TestBodyAccounting:
     def test_empty_body_succeeds_with_zero_bytes(self) -> None:
         clk = Clock()
         transport, _, _ = build([resp([], clk)])
-        assert (transport.fetch("https://x/y", 5.0).ok,) == (True,)
+        assert transport.fetch("https://x/y", 5.0).ok is True
 
     def test_get_uses_path_and_query(self) -> None:
         # FR-2.5 relies on our own header set; verify the request line too.
@@ -186,7 +186,7 @@ class TestLateEofRegression:
     def test_ontime_completion_still_succeeds(self) -> None:
         clk = Clock()
         transport, _, _ = build([resp([b"x" * 10], clk, eof_delay=0.0)])
-        assert (transport.fetch("https://h/p", timeout=2.0).ok,) == (True,)
+        assert transport.fetch("https://h/p", timeout=2.0).ok is True
 
 
 class TestRedirects:

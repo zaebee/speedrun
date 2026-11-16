@@ -107,7 +107,10 @@ class TestConstantMemory:
         """
         small_rss, small_bytes, small_rc = _download_and_measure(SMALL)
         large_rss, large_bytes, large_rc = _download_and_measure(LARGE)
-        assert small_rc == 0 and large_rc == 0, "a download failed; the comparison is meaningless"
+        # Split rather than combined: one assertion covering two measurements reports
+        # "a download failed" without saying which, sending the reader to re-run both.
+        assert small_rc == 0, f"{SMALL} did not complete (rc={small_rc})"
+        assert large_rc == 0, f"{LARGE} did not complete (rc={large_rc})"
         assert small_bytes > 9_000_000, small_bytes
         assert large_bytes > 99_000_000, large_bytes
 
