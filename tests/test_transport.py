@@ -4,7 +4,7 @@ The old transport needed 270 lines of scripted-clock, stub-socket tests because 
 implemented HTTP by hand. On HTTPX those details are the library's responsibility
 and are exercised by HTTPX's own test suite; what remains here is OUR contract:
 identity-encoding requests, wire-byte accounting, final-status semantics, the
-absolute deadline, and the single stale-connection retry.
+absolute deadline, and the no-retry failure contract.
 
 MockTransport is HTTPX's supported extension point - no private internals.
 """
@@ -178,7 +178,7 @@ class TestStatusSemantics:
 
 
 class TestAbsoluteDeadline:
-    """FR-3.5: wait_for bounds the entire exchange, not per-phase waits."""
+    """FR-3.5: the deadline context manager bounds the entire exchange, not per-phase waits."""
 
     def test_slow_streaming_body_hits_the_deadline(self) -> None:
         """A trickling sender is the case per-phase timeouts cannot bound."""
@@ -243,50 +243,39 @@ class TestAbsoluteDeadline:
         assert result.error
 
 
-class TestStaleConnectionRetry:
-    """A keep-alive race is not a measurement of the resource (FR-2.3)."""
+class TestNoRetriesAtAll:
+    """Every failure is one failed request: no attempt is ever silently re-issued.
 
-    def test_one_disconnection_that_looks_stale_is_retried(self) -> None:
+    FR-2.1 promises exactly N requests; FR-2.1's physical counterpart is that one
+    logical request is exactly one GET. Whether a server processed a request before
+    closing is not observable through HTTPX's supported API, so a retry can never
+    be proven safe and none is attempted. A pre-header connection failure is an
+    honest failed request, visible in the run summary.
+    """
+
+    def test_pre_response_disconnect_fails_without_a_second_attempt(self) -> None:
         calls = {"n": 0}
 
         def handler(request: httpx.Request) -> httpx.Response:
             calls["n"] += 1
-            if calls["n"] == 1:
-                raise httpx.ConnectError("server disconnected")
-            return resp(200, b"second try")
+            raise httpx.ConnectError("server disconnected")
 
         transport = transport_for(handler)
         try:
             result = fetch(transport, "https://x/y")
         finally:
             close(transport)
-        assert result.ok is True
-        assert calls["n"] == 2
-
-    def test_genuine_server_errors_are_not_retried(self) -> None:
-        calls = {"n": 0}
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            calls["n"] += 1
-            return resp(503, b"overloaded")
-
-        transport = transport_for(handler)
-        try:
-            result = fetch(transport, "https://x/y")
-        finally:
-            close(transport)
-        assert calls["n"] == 1
         assert result.ok is False
-        assert "503" in (result.error or "")
+        assert calls["n"] == 1
+        assert result.bytes == 0
 
 
 class TestMidBodyDisconnectIsNotRetried:
-    """P1: a truncating disconnect must fail, not silently become a second attempt.
+    """A truncating disconnect must fail, not silently become a second attempt.
 
-    The previous retry gate matched exception text ("peer closed"), which a
-    mid-body disconnect also matches - so a truncated transfer could be retried and
-    reported as a success, with an unaccounted physical GET. The gate is now
-    connection state: only an error before the response started is retried.
+    Pins the no-retry contract against the two historical implementations: one
+    matched exception text ("peer closed"), one gated on "headers not received" -
+    both retried this shape at least once.
     """
 
     def test_disconnect_after_response_started_is_reported_failed(self) -> None:
@@ -315,38 +304,4 @@ class TestMidBodyDisconnectIsNotRetried:
             result.error or ""
         )
         assert result.bytes == 0  # FR-5.2: a truncated transfer contributes nothing
-        assert calls["n"] == 1, "mid-body disconnect must not be retried"
-
-    def test_disconnect_before_response_starts_is_retried_once(self) -> None:
-        calls = {"n": 0}
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            calls["n"] += 1
-            if calls["n"] == 1:
-                # Raised while handling the request: no response has started.
-                raise httpx.ConnectError("connection closed before response")
-            return resp(200, b"recovered")
-
-        transport = transport_for(handler)
-        try:
-            result = fetch(transport, "https://x/y")
-        finally:
-            close(transport)
-        assert result.ok is True
-        assert result.bytes == len(b"recovered")
-        assert calls["n"] == 2
-
-    def test_two_failures_in_a_row_are_not_infinitely_retried(self) -> None:
-        calls = {"n": 0}
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            calls["n"] += 1
-            raise httpx.ConnectError("connection closed before response")
-
-        transport = transport_for(handler)
-        try:
-            result = fetch(transport, "https://x/y")
-        finally:
-            close(transport)
-        assert result.ok is False
-        assert calls["n"] == 2
+        assert calls["n"] == 1

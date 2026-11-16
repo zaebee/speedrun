@@ -136,7 +136,7 @@ The choices below change the numbers, so they are documented rather than hidden:
 - **`--timeout` is an absolute deadline on the whole request.** HTTPX's own timeouts
   are per-phase and its read timeout resets whenever any byte arrives, so a trickling
   server could run arbitrarily long past them (measured: 4.4 s of trickle under a
-  0.6 s read timeout). The deadline is therefore enforced with `asyncio.wait_for`
+  0.6 s read timeout). The deadline is therefore enforced with `asyncio.timeout`
   around the entire exchange, including body consumption. Not covered: DNS resolution
   (resolver timeouts are not ours); the deadline fires on time, but a resolver thread
   may linger.

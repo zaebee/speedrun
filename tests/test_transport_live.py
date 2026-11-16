@@ -143,3 +143,31 @@ class TestFailureIsolation:
         summary = run("https://x/y", requests=2, timeout=5.0, transport=Buggy(), quiet=True)
         assert summary.fail_count == 2
         assert summary.ok_count == 0
+
+
+class TestNoSecondPhysicalGet:
+    """FR-2.1 at the socket level: one logical request is exactly one GET.
+
+    The audit's requested regression: a server that accepts the request and closes
+    before response headers. The failure is reported; no second GET is issued - the
+    historical retry (text-heuristic, then headers-not-received gate) would both
+    have issued one here.
+    """
+
+    def test_pre_header_close_fails_without_a_second_request(self) -> None:
+        from local_server import AcceptThenCloseServer
+
+        with AcceptThenCloseServer() as raw:
+            transport = HttpTransport()
+
+            async def fetch():
+                try:
+                    return await transport.fetch(f"{raw.base_url}/x")
+                finally:
+                    await transport.aclose()
+
+            result = asyncio.run(fetch())
+
+        assert result.ok is False
+        assert result.bytes == 0
+        assert raw.requests_seen == 1, f"expected exactly one GET, saw {raw.requests_seen}"

@@ -366,27 +366,18 @@ class HttpTransport:
     async def _exchange(self, url: str) -> tuple[int, int]:
         """Stream one response to completion; return (payload bytes, final status).
 
-        The stale-connection race of every keep-alive client: the server may close
-        an idle connection at any moment, and the failure surfaces on the first
-        request that touches it. That one failure is retried, because counting it
-        would report a connection event as the resource's speed (FR-2.3).
-
-        The retry is gated on CONNECTION STATE, not exception text: only an error
-        raised before the response started is eligible. A disconnect after the
-        first byte of the body is a truncated transfer and is reported as a failed
-        request - retrying it would silently turn a broken response into a success
-        and add an unaccounted physical GET.
+        No retries, deliberately. The keep-alive stale-connection race - a server
+        closing an idle connection, or closing after accepting the GET but before
+        the response headers - surfaces as one failed request, and that is the
+        honest result: whether the server processed the request before closing is
+        not observable through HTTPX's supported API, so a retry here would be a
+        second physical GET invisible in the reported request count (FR-2.1). The
+        failure is visible in the run summary instead, which is what a measurement
+        tool owes its operator. See SPEC FR-2.3 and open decision 5.
         """
-        for attempt in (1, 2):
-            response_started = [False]
-            try:
-                return await self._stream_once(url, response_started)
-            except (httpx.RemoteProtocolError, httpx.ConnectError):
-                if response_started[0] or attempt == 2:
-                    raise
-        raise AssertionError("unreachable")
+        return await self._stream_once(url)
 
-    async def _stream_once(self, url: str, response_started: list[bool]) -> tuple[int, int]:
+    async def _stream_once(self, url: str) -> tuple[int, int]:
         client = self._get_client()
         # Per-phase timeouts cap each blocking step at the budget; the absolute
         # bound is asyncio.timeout in fetch(). Without them a stalled step could
@@ -397,10 +388,6 @@ class HttpTransport:
             headers={"Accept-Encoding": "identity"},
             timeout=httpx.Timeout(self.timeout),
         ) as response:
-            # Entering the context means headers were received; from here a
-            # connection failure is a truncated transfer, never a stale idle
-            # connection - the retry gate in _exchange depends on this flag.
-            response_started[0] = True
             size = 0
             async for chunk in response.aiter_raw(chunk_size=_CHUNK):
                 size += len(chunk)
@@ -593,9 +580,9 @@ def main(argv: Sequence[str] | None = None, transport: Transport | None = None) 
     try:
         return asyncio.run(_amain(args, transport))
     except KeyboardInterrupt:
-        # On 3.10 the first Ctrl-C surfaces here without the task having printed its
-        # partial summary; 3.11+ keeps NFR-4's full behaviour. Either way the process
-        # must exit as interrupted (AC-13).
+        # Defensive: on 3.11+ the task suppresses the cancellation and prints its
+        # partial summary, so this only fires for a second Ctrl-C during cleanup.
+        # Either way the process must exit as interrupted (AC-13).
         return int(ExitCode.INTERRUPTED)
 
 

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import gzip
 import http.server
+import socket
 import socketserver
 import threading
 from collections.abc import Callable
@@ -251,3 +252,76 @@ class LocalTestServer(socketserver.ThreadingTCPServer):
         self.server_close()
         if self._thread is not None:
             self._thread.join(timeout=5)
+
+
+class AcceptThenCloseServer:
+    """A raw TCP server that accepts a request and closes before any response.
+
+    Exists to pin the no-retry contract at the socket level: exactly one GET may
+    arrive for one logical request, even when the server answers it with a
+    disconnect instead of headers.
+    """
+
+    def __init__(self) -> None:
+        import socket
+        import threading
+
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._sock.bind(("127.0.0.1", 0))
+        self._sock.listen(4)
+        self.port = self._sock.getsockname()[1]
+        self.requests_seen = 0
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+
+    def _serve(self) -> None:
+
+        self._sock.settimeout(0.2)
+        while not self._stop.is_set():
+            try:
+                conn, _ = self._sock.accept()
+            except TimeoutError:
+                continue
+            # Consume the request head, then close without answering anything.
+            try:
+                conn.settimeout(2)
+                head = b""
+                while b"\r\n\r\n" not in head:
+                    chunk = self._drain(conn)
+                    if not chunk:
+                        break
+                    head += chunk
+                # Count actual HTTP requests, not raw accepts: the shutdown wake
+                # connection opens the port without sending a request line.
+                if b"GET" in head:
+                    self.requests_seen += 1
+            except OSError:
+                pass
+            finally:
+                conn.close()
+
+    @staticmethod
+    def _drain(conn: socket.socket) -> bytes:
+        data = conn.recv(4096)
+        return data or b""
+
+    @property
+    def base_url(self) -> str:
+        return f"http://127.0.0.1:{self.port}"
+
+    def __enter__(self) -> AcceptThenCloseServer:
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._stop.set()
+        # Wake the accept loop so it notices the stop flag.
+        try:
+            wake = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            wake.connect(("127.0.0.1", self.port))
+            wake.close()
+        except OSError:
+            pass
+        self._thread.join(timeout=5)
+        self._sock.close()

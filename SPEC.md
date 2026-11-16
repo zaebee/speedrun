@@ -58,6 +58,12 @@ Code `2` is kept distinct from `1` on purpose: "invoked wrong" differs from
 - **FR-2.3.** The session is reused across requests (keep-alive). Otherwise a
   TCP+TLS handshake lands in every sample and the result measures something
   other than what was asked. A deliberate measurement-model choice, see NFR-3.
+  Known consequence, documented rather than hidden: the keep-alive stale-connection
+  race (server closes an idle connection, possibly after processing the request) is
+  reported as one failed request. No retry is attempted - see open decision 5.
+  Verified by counting accepted TCP sockets: N requests must yield N or fewer
+  connections, and one logical request is exactly one physical GET
+  (TestNoSecondPhysicalGet).
 - **FR-2.4.** No delay between requests.
 - **FR-2.5.** `Accept-Encoding` is pinned to `identity`, so the counted volume is
   the response body as delivered, with no decoding step in between (see FR-4.3 and
@@ -228,26 +234,34 @@ Deliberate trade-offs, not forgotten cases.
 
 1. **stdlib-only was dropped in favour of HTTPX** (supersedes the original decision).
    The hand-rolled `http.client` transport cost ~300 lines - pooling, redirect hops,
-   stale-connection retry, socket re-arming, drain - and still shipped two real bugs
-   (a no-op socket timeout and a deadline that trickle streams could outrun). HTTPX
+   a keep-alive retry, socket re-arming, drain - and still shipped two real bugs
+   (a socket timeout armed on an object that exposes no socket, i.e. a silent no-op,
+   and a deadline that trickle streams could outrun through read-buffering). HTTPX
    provides all of it as supported behaviour; this module keeps only measurement.
    Price: one dependency and its tree (httpcore, anyio, certifi, h11), and an
    event loop per run() call.
-4. **Absolute deadline via asyncio.timeout, not client timeouts.** HTTPX timeouts
-   are per-phase and the read timeout resets on every arrival, so a trickling body is
-   unbounded under them (measured: 4.4 s of trickle under a 0.6 s read timeout).
-   The timeout context manager around the whole exchange, including body consumption,
-   is what makes --timeout absolute. Same non-interruptible phase as before: DNS runs
-   in a worker thread; the deadline fires on time but the resolver may linger.
-   Resolution: request `Accept-Encoding: identity` (FR-2.5), so received bytes
-   equal the body. `http.client` with manual reads stays a fallback if that ever
-   proves unacceptable.
 2. **Median in the output** goes beyond the literal brief ("average time").
    Kept: without it a single number misleads. Trivially removable.
 3. **The first request includes the handshake** and is therefore slower than the
    rest. No warm-up skip: at N=10 that discards 10% of the sample to hide an
    effect the median already reveals. A `--skip-first` flag is a cheap addition
    if wanted.
+4. **Absolute deadline via asyncio.timeout, not client timeouts.** HTTPX timeouts
+   are per-phase and the read timeout resets on every arrival, so a trickling body is
+   unbounded under them (measured: 4.4 s of trickle under a 0.6 s read timeout).
+   The timeout context manager around the whole exchange, including body consumption,
+   is what makes --timeout absolute. Same non-interruptible phase as before: DNS runs
+   in a worker thread; the deadline fires on time but the resolver may linger.
+5. **No retries, including for the keep-alive stale-connection race.** A server may
+   close an idle connection, or close after accepting the GET but before the response
+   headers; whether it processed the request first is not observable through HTTPX's
+   supported API. A retry would therefore be a second physical GET invisible in the
+   reported request count (FR-2.1), and for a POST-shaped future it would risk a
+   duplicated effect. Two earlier gates - exception-text matching, then "headers not
+   received" - were both rejected in review as proxies that a server-side
+   pre-header close defeats. Consequence: the race surfaces as one failed request in
+   the run summary; `--requests N` is exactly N GETs, verified at the socket level by
+   TestNoSecondPhysicalGet.
 
 ## 7. Verification strategy
 
