@@ -400,11 +400,24 @@ class HttpTransport:
 
     @staticmethod
     def _drain(response: Any) -> None:
-        try:
+        """Consume a redirect's body so the pooled connection stays usable.
+
+        Load-bearing, and pinned by TestRedirectWithBody: a 302 that also carries a
+        payload leaves unread bytes on the socket, and http.client then raises
+        ResponseNotReady on the next request through this connection.
+
+        Failures while draining are ignored deliberately - the redirect decision is
+        already made, and if the socket is genuinely broken the next request finds
+        out for itself and gets a fresh connection. Only I/O-layer errors qualify;
+        anything else is a bug and must surface.
+        """
+        # The body is read purely to advance the stream; its content is irrelevant
+        # and deliberately discarded, which is what makes this loop's body empty.
+        # Volume accounting for the attempt uses the final response only (FR-4.1),
+        # asserted by TestRedirectWithBody.
+        with contextlib.suppress(OSError, http.client.HTTPException):
             while response.read(65_536):
-                pass
-        except Exception:
-            pass
+                continue
 
     def _exchange_resilient(
         self, scheme: str, host: str, port: int, path: str, deadline: float
