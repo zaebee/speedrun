@@ -32,10 +32,10 @@ def fetch_measured(url: str, timeout: float) -> Measured:
     """One fetch in its own loop, timing it there; the loop owns the transport."""
 
     async def run_one() -> Measured:
-        transport = HttpTransport()
+        transport = HttpTransport(timeout=timeout)
         started = time.monotonic()
         try:
-            result = await transport.fetch(url, timeout)
+            result = await transport.fetch(url)
             elapsed = time.monotonic() - started
             return Measured(result=result, elapsed=elapsed)
         finally:
@@ -102,8 +102,14 @@ class TestDeadlineAgainstRealSocket:
         async def fetch_both() -> tuple[FetchResult, FetchResult]:
             transport = HttpTransport()
             try:
-                bad = await transport.fetch(f"{server.base_url}/stalled", 0.4)
-                good = await transport.fetch(f"{server.base_url}/payload=1000", 10.0)
+                bad = (
+                    transport.set_deadline(0.4),
+                    await transport.fetch(f"{server.base_url}/stalled"),
+                )[1]
+                good = (
+                    transport.set_deadline(10.0),
+                    await transport.fetch(f"{server.base_url}/payload=1000"),
+                )[1]
                 return bad, good
             finally:
                 await transport.aclose()
@@ -131,7 +137,7 @@ class TestFailureIsolation:
 
     def test_run_survives_a_transport_that_raises_arbitrarily(self) -> None:
         class Buggy:
-            async def fetch(self, url: str, timeout: float) -> FetchResult:
+            async def fetch(self, url: str) -> FetchResult:
                 raise RuntimeError("bug in transport")
 
         summary = run("https://x/y", requests=2, timeout=5.0, transport=Buggy(), quiet=True)

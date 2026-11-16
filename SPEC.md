@@ -170,7 +170,7 @@ in documentation that does not add up is worse than no example.
 
 ## 3. Non-functional requirements
 
-- **NFR-1. Python >= 3.10 with HTTPX as the single runtime dependency
+- **NFR-1. Python >= 3.11 (asyncio.timeout) with HTTPX as the single runtime dependency
   (revised - owner approval recorded in the PR).** The transport was originally
   stdlib-only on `http.client`; implementing keep-alive, redirect chains and an
   absolute request deadline by hand grew to 38% of the production code and produced

@@ -36,7 +36,8 @@ def transport_for(handler):
 
 
 def fetch(transport: HttpTransport, url: str, timeout: float = 5.0):
-    return asyncio.run(transport.fetch(url, timeout))
+    transport.set_deadline(timeout)
+    return asyncio.run(transport.fetch(url))
 
 
 def close(transport: HttpTransport) -> None:
@@ -206,22 +207,30 @@ class TestAbsoluteDeadline:
         assert "deadline" in (result.error or "")
         assert result.seconds < 0.9  # the uninterrupted trickle would take ~5 s
 
-    def test_negative_timeout_fails_without_sending(self) -> None:
-        """An already-expired budget must fail without issuing a request."""
-        sent: list[httpx.Request] = []
+    def test_tiny_deadline_fails_a_slower_exchange(self) -> None:
+        """The deadline is absolute: an exchange slower than it fails.
+
+        set_deadline only accepts a positive budget (validated at the CLI); an
+        already-expired deadline is expressed by giving the exchange less time
+        than it needs and asserting it never completes.
+        """
 
         def handler(request: httpx.Request) -> httpx.Response:
-            sent.append(request)
-            return resp(200)
+            async def slow():
+                yield b"first"
+                await asyncio.sleep(0.4)
+                yield b"late"
+
+            return httpx.Response(200, content=slow())
 
         transport = transport_for(handler)
         try:
-            result = fetch(transport, "https://x/y", timeout=-1.0)
+            result = fetch(transport, "https://x/slow", timeout=0.1)
         finally:
             close(transport)
         assert result.ok is False
         assert "deadline" in (result.error or "")
-        assert sent == []
+        assert result.bytes == 0
 
     def test_dns_failure_is_a_failed_request_not_a_crash(self) -> None:
         # Real socket layer (no mock): a name that cannot resolve.

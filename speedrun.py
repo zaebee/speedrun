@@ -261,11 +261,16 @@ class Transport(Protocol):
     orchestration tests free of HTTP semantics entirely.
     """
 
-    async def fetch(self, url: str, timeout: float) -> FetchResult: ...
+    async def fetch(self, url: str) -> FetchResult: ...
 
+    def set_deadline(self, seconds: float) -> None:
+        """Set the absolute bound for subsequent fetches (FR-3.5).
 
-class DeadlineExceeded(OSError):
-    """The whole-request deadline passed before the attempt could do any work."""
+        Sync, and outside the coroutine on purpose: the deadline is configuration,
+        not a parameter threaded through async code. Enforced by the implementation
+        with a timeout context manager around the whole exchange.
+        """
+        ...
 
 
 def _reason(exc: BaseException) -> str:
@@ -286,7 +291,7 @@ class HttpTransport:
     - an absolute deadline per request. HTTPX's connect/read/write/pool timeouts
       are per-phase, and the read timeout resets whenever any byte arrives, so a
       trickling response can run arbitrarily long past it (measured: 4.4 s of
-      trickle under a 0.6 s read timeout). asyncio.wait_for around the entire
+      trickle under a 0.6 s read timeout). asyncio.timeout around the entire
       exchange, including body consumption, is what makes --timeout an absolute
       bound (FR-3.5);
     - payload accounting: ``aiter_raw`` with ``Accept-Encoding: identity`` counts
@@ -300,7 +305,11 @@ class HttpTransport:
     """
 
     now: Callable[[], float] = time.monotonic
+    timeout: float = 30.0
     _client: httpx.AsyncClient | None = field(default=None, repr=False)
+
+    def set_deadline(self, seconds: float) -> None:
+        self.timeout = seconds
 
     def _get_client(self) -> httpx.AsyncClient:
         if self._client is None:
@@ -319,23 +328,22 @@ class HttpTransport:
             await self._client.aclose()
             self._client = None
 
-    async def fetch(self, url: str, timeout: float) -> FetchResult:
+    async def fetch(self, url: str) -> FetchResult:
         start = self.now()
-        remaining = timeout - (self.now() - start)
-        if remaining <= 0:
-            return self._failure(DeadlineExceeded("deadline already passed"), start)
-
         try:
-            size, status = await asyncio.wait_for(self._exchange(url, timeout), timeout=remaining)
-        except asyncio.TimeoutError:
-            # This is our deadline firing mid-exchange - the deliberate outcome for
-            # any exchange slower than --timeout (FR-3.5).
+            # asyncio.timeout is the whole-request deadline (FR-3.5): it cancels the
+            # exchange at the budget's end wherever it happens to be blocked - connect,
+            # headers, or mid-body. HTTPX's per-phase timeouts are only a stall guard.
+            async with asyncio.timeout(self.timeout):
+                size, status = await self._exchange(url)
+        except TimeoutError:
+            # The deliberate outcome for any exchange slower than --timeout.
             elapsed = self.now() - start
             return FetchResult(
                 ok=False,
                 seconds=elapsed,
                 bytes=0,
-                error=f"exceeded {timeout:g} s deadline",
+                error=f"exceeded {self.timeout:g} s deadline",
             )
         except httpx.TooManyRedirects:
             return FetchResult(
@@ -354,7 +362,7 @@ class HttpTransport:
             return FetchResult(ok=False, seconds=seconds, bytes=0, error=f"HTTP {status}")
         return FetchResult(ok=True, seconds=seconds, bytes=size, error=None)
 
-    async def _exchange(self, url: str, timeout: float) -> tuple[int, int]:
+    async def _exchange(self, url: str) -> tuple[int, int]:
         """Stream one response to completion; return (payload bytes, final status).
 
         A stale pooled connection can surface as a protocol error on the first
@@ -364,22 +372,22 @@ class HttpTransport:
         integrity). Any second failure is this request's outcome.
         """
         try:
-            return await self._stream_once(url, timeout)
+            return await self._stream_once(url)
         except (httpx.RemoteProtocolError, httpx.ConnectError) as exc:
             if not self._looks_like_stale_connection(exc):
                 raise
-            return await self._stream_once(url, timeout)
+            return await self._stream_once(url)
 
-    async def _stream_once(self, url: str, timeout: float) -> tuple[int, int]:
+    async def _stream_once(self, url: str) -> tuple[int, int]:
         client = self._get_client()
-        # Per-phase timeouts are set to the full budget; the absolute bound is
-        # wait_for in fetch(). read=timeout alone would let a trickling body run
-        # arbitrarily long past --timeout.
+        # Per-phase timeouts cap each blocking step at the budget; the absolute
+        # bound is asyncio.timeout in fetch(). Without them a stalled step could
+        # hang on OS-level defaults well past the deadline.
         async with client.stream(
             "GET",
             url,
             headers={"Accept-Encoding": "identity"},
-            timeout=httpx.Timeout(timeout),
+            timeout=httpx.Timeout(self.timeout),
         ) as response:
             size = 0
             async for chunk in response.aiter_raw(chunk_size=_CHUNK):
@@ -414,9 +422,7 @@ def _progress_line(index: int, total: int, result: FetchResult) -> str:
     return f"{label} FAILED    {result.seconds:7.3f} s   {result.error or 'error'}"
 
 
-async def _attempt(
-    transport: Transport, url: str, timeout: float, now: Callable[[], float]
-) -> FetchResult:
+async def _attempt(transport: Transport, url: str, now: Callable[[], float]) -> FetchResult:
     """Run one request, timing it on both the success and failure paths (FR-3.1).
 
     Failures are contained here: FR-5.1 says one bad request never aborts a run,
@@ -428,7 +434,7 @@ async def _attempt(
     """
     start = now()
     try:
-        return await transport.fetch(url, timeout)
+        return await transport.fetch(url)
     except (KeyboardInterrupt, asyncio.CancelledError):
         raise
     except Exception as exc:
@@ -442,7 +448,7 @@ async def _collect(
     results: list[FetchResult] = []
     for index in range(1, args.requests + 1):
         try:
-            result = await _attempt(transport, url, args.timeout, time.monotonic)
+            result = await _attempt(transport, url, time.monotonic)
         except (asyncio.CancelledError, KeyboardInterrupt):
             # Ctrl-C cancels the enclosing task; whatever was measured so far is
             # still a measurement and must reach the operator (NFR-4).
@@ -458,7 +464,6 @@ async def _collect(
 async def _arun(
     url: str,
     requests: int,
-    timeout: float,
     transport: Transport,
     quiet: bool,
     emit: Emit | None,
@@ -470,7 +475,7 @@ async def _arun(
     try:
         for index in range(1, requests + 1):
             try:
-                result = await _attempt(transport, url, timeout, now)
+                result = await _attempt(transport, url, now)
             except (asyncio.CancelledError, KeyboardInterrupt):
                 # This loop owns the event loop (see run()), so it also owns
                 # releasing the transport's connections - here, not in some
@@ -507,7 +512,19 @@ def run(
     therefore not be shared across separate run() calls - within one call its
     connections are pooled and reused (FR-2.3); across calls it would not be.
     """
-    return asyncio.run(_arun(url, requests, timeout, transport, quiet, emit, now))
+    set_deadline(transport, timeout)
+    return asyncio.run(_arun(url, requests, transport, quiet, emit, now))
+
+
+def set_deadline(transport: Transport, seconds: float) -> None:
+    """Hand the deadline to the transport, if it accepts one.
+
+    Sync, and outside the event loop: the deadline is run configuration. Transports
+    without a deadline (test doubles that return instantly) skip it silently.
+    """
+    configure = getattr(transport, "set_deadline", None)
+    if configure is not None:
+        configure(seconds)
 
 
 # --- Output rendering ---------------------------------------------------------
@@ -546,6 +563,7 @@ async def _amain(args: argparse.Namespace, transport: Transport | None) -> int:
         return int(ExitCode.USAGE)
 
     active: Transport = transport if transport is not None else HttpTransport()
+    set_deadline(active, args.timeout)
     started = time.monotonic()
     try:
         results, interrupted = await _collect(active, url, args)

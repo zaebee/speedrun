@@ -20,7 +20,7 @@ class ScriptedTransport:
         self.script = list(script)
         self.calls = 0
 
-    async def fetch(self, url: str, timeout: float) -> FetchResult:
+    async def fetch(self, url: str) -> FetchResult:
         item = self.script[min(self.calls, len(self.script) - 1)]
         self.calls += 1
         if isinstance(item, BaseException):

@@ -52,8 +52,8 @@ class TestAgainstRealHost:
             def __init__(self, inner: HttpTransport) -> None:
                 self.inner = inner
 
-            async def fetch(self, url: str, timeout: float) -> FetchResult:
-                r = await self.inner.fetch(url, timeout)
+            async def fetch(self, url: str) -> FetchResult:
+                r = await self.inner.fetch(url)
                 results.append(r)
                 return r
 

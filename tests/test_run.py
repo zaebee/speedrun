@@ -30,17 +30,18 @@ class FakeTransport(Transport):
 
     def __init__(self, script: list[FetchResult | Exception]) -> None:
         self.script = list(script)
-        self.calls: list[tuple[str, float]] = []
+        self.calls: list[str] = []
+        self.timeout: float | None = None
 
-    async def fetch(self, url: str, timeout: float) -> FetchResult:
-        self.calls.append((url, timeout))
+    def set_deadline(self, seconds: float) -> None:
+        self.timeout = seconds
+
+    async def fetch(self, url: str) -> FetchResult:
+        self.calls.append(url)
         item = self.script[len(self.calls) - 1]
         if isinstance(item, Exception):
             raise item
         return item
-
-    def close(self) -> None:
-        """Transport protocol requires it; the fake holds no resources."""
 
 
 def ok(seconds: float, nbytes: int) -> FetchResult:
@@ -58,10 +59,11 @@ class TestRunsExactlyNSequentialRequests:
         assert len(t.calls) == 10
         assert summary.ok_count == 10
 
-    def test_passes_url_and_timeout_to_every_call(self) -> None:
+    def test_passes_url_to_every_call_and_sets_the_deadline(self) -> None:
         t = FakeTransport([ok(0.1, 10)] * 3)
         run("https://x/y", requests=3, timeout=7.5, transport=t, quiet=True)
-        assert t.calls == [("https://x/y", 7.5)] * 3
+        assert t.calls == ["https://x/y"] * 3
+        assert t.timeout == 7.5  # set_deadline handed the budget to the transport
 
     def test_sequential_order_no_concurrency(self) -> None:
         # FR-2.1: the loop must consume the script in order. A concurrent
@@ -181,14 +183,14 @@ class TestExceptionDurationsAreReal:
             return clock["t"]
 
         class SlowFail:
-            async def fetch(self, url: str, timeout: float) -> FetchResult:
+            async def fetch(self, url: str) -> FetchResult:
                 clock["t"] += 12.5
                 raise ConnectionError("reset by peer")
 
             def close(self) -> None:
                 return None
 
-        result = asyncio.run(_attempt(SlowFail(), "https://x/y", 30.0, now))
+        result = asyncio.run(_attempt(SlowFail(), "https://x/y", now))
         assert result.ok is False
         assert result.seconds == pytest.approx(12.5)
         assert "ConnectionError" in (result.error or "")
@@ -203,7 +205,7 @@ class TestExceptionDurationsAreReal:
             def __init__(self, delay: float) -> None:
                 self.delay = delay
 
-            async def fetch(self, url: str, timeout: float) -> FetchResult:
+            async def fetch(self, url: str) -> FetchResult:
                 clock["t"] += self.delay
                 raise TimeoutError("stalled")
 
@@ -229,14 +231,14 @@ class TestExceptionDurationsAreReal:
         import time as _time
 
         class Sleeping:
-            async def fetch(self, url: str, timeout: float) -> FetchResult:
+            async def fetch(self, url: str) -> FetchResult:
                 await asyncio.sleep(0.05)
                 raise TimeoutError("slow failure")
 
             def close(self) -> None:
                 return None
 
-        result = asyncio.run(_attempt(Sleeping(), "https://x/y", 30.0, _time.monotonic))
+        result = asyncio.run(_attempt(Sleeping(), "https://x/y", _time.monotonic))
         assert result.ok is False
         assert result.seconds >= 0.04  # measured, not fabricated
 
@@ -263,7 +265,7 @@ class TestWallClockIsIndependent:
         state = {"t": 0.0}
 
         class Gappy:
-            async def fetch(self, url: str, timeout: float) -> FetchResult:
+            async def fetch(self, url: str) -> FetchResult:
                 state["t"] += 1.0
                 return ok(0.5, 100)
 
@@ -294,7 +296,7 @@ class TestWallClockIsIndependent:
             def __init__(self) -> None:
                 self.n = 0
 
-            async def fetch(self, url: str, timeout: float) -> FetchResult:
+            async def fetch(self, url: str) -> FetchResult:
                 self.n += 1
                 if self.n > 1:
                     _time.sleep(0.05)  # cost incurred before the timed request
@@ -340,7 +342,7 @@ class TestOnlyExceptionsAreContained:
 
     def test_system_exit_propagates_rather_than_becoming_a_failed_request(self) -> None:
         class Exits:
-            async def fetch(self, url: str, timeout: float) -> FetchResult:
+            async def fetch(self, url: str) -> FetchResult:
                 raise SystemExit(3)
 
             def close(self) -> None:
@@ -348,13 +350,13 @@ class TestOnlyExceptionsAreContained:
 
         transport = Exits()
         with pytest.raises(SystemExit) as excinfo:
-            asyncio.run(_attempt(transport, "https://x/y", 5.0, time.monotonic))
+            asyncio.run(_attempt(transport, "https://x/y", time.monotonic))
         # The exit code must survive intact, not be converted into a failed request.
         assert excinfo.value.code == 3
 
     def test_keyboard_interrupt_still_propagates(self) -> None:
         class Interrupts:
-            async def fetch(self, url: str, timeout: float) -> FetchResult:
+            async def fetch(self, url: str) -> FetchResult:
                 raise KeyboardInterrupt
 
             def close(self) -> None:
@@ -362,4 +364,4 @@ class TestOnlyExceptionsAreContained:
 
         transport = Interrupts()
         with pytest.raises(KeyboardInterrupt):
-            asyncio.run(_attempt(transport, "https://x/y", 5.0, time.monotonic))
+            asyncio.run(_attempt(transport, "https://x/y", time.monotonic))

@@ -25,7 +25,7 @@ Throughput     16.10 MiB/s   (135.06 Mbps)
 
 ## Requirements
 
-Python 3.10 or newer, plus [HTTPX](https://www.python-httpx.org) — the only runtime
+Python 3.11 or newer, plus [HTTPX](https://www.python-httpx.org) — the only runtime
 dependency, and it owns the HTTP semantics (connections, redirects, decoding) while
 the script owns measurement:
 
