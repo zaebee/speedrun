@@ -1,0 +1,8 @@
+# Environments and tooling caches - never part of the deliverable
+.venv/
+.uvcache/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
