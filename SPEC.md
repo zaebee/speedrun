@@ -40,28 +40,54 @@ Validation:
   no network request is made.
 - **FR-1.3.** `--requests < 1` -> usage error, exit code `2`.
 - **FR-1.4.** Unknown flag -> standard argparse message, exit code `2`.
+- **FR-1.5.** `--timeout` must be finite and > 0; zero, negative, NaN and infinity
+  are usage errors with exit code `2`. Zero would fail every attempt for a reason
+  the user cannot see, and NaN silently disables the deadline comparison
+  (`now() > nan` is always false).
 
 Code `2` is kept distinct from `1` on purpose: "invoked wrong" differs from
 "could not measure".
 
 ### FR-2. Request sequence
 
-- **FR-2.1.** Exactly `N` requests, strictly one after another. The next starts
-  only once the previous has fully completed or been recorded as failed.
+- **FR-2.1.** `--requests N` means exactly `N` sequential **top-level fetch
+  attempts**, one after another: the next starts only once the previous has fully
+  completed or been recorded as failed. A failed attempt is reported as failed;
+  the tool performs no automatic retries.
+
+  Counting model: redirect hops are internal to a fetch attempt and are handled by
+  HTTPX, so an attempt that meets a redirecting server may comprise several
+  physical HTTP requests on the same connection (bounded by 5 hops, FR-5.4a).
+  One attempt is therefore not universally one physical GET; what is guaranteed is
+  N attempts, no hidden retries, and - absent redirects on the target - one
+  physical GET per attempt, pinned by `TestNoSecondPhysicalGet` at the socket
+  level for the pre-header-failure case.
 - **FR-2.2.** Each response is read to the end. This requirement is substantive:
   a connection with an unread body is not a complete exchange and its volume is
   unknown. The body is read in chunks and discarded, never buffered whole.
 - **FR-2.3.** The session is reused across requests (keep-alive). Otherwise a
   TCP+TLS handshake lands in every sample and the result measures something
   other than what was asked. A deliberate measurement-model choice, see NFR-3.
+  Known consequence, documented rather than hidden: the keep-alive stale-connection
+  race (server closes an idle connection, possibly after processing the request) is
+  reported as one failed attempt. No retry is attempted - see open decision 5.
+  Connection reuse is verified by counting accepted TCP sockets on a local server:
+  N attempts against one non-redirecting host must yield one connection
+  (TestConnectionReuse).
 - **FR-2.4.** No delay between requests.
-- **FR-2.5.** `Accept-Encoding` is pinned to `identity`; bodies are requested
-  uncompressed so that bytes-on-the-wire equal body size (see FR-4.3 and open
-  decision 1).
+- **FR-2.5.** `Accept-Encoding` is pinned to `identity`, so the counted volume is
+  the response body as delivered, with no decoding step in between (see FR-4.3 and
+  open decision 1).
+- **FR-4.5.** Terminology is fixed by this: the measured quantity is **HTTP response
+  payload**. It is not "bytes on the wire" - request/response headers, chunked
+  transfer framing, TLS record overhead and TCP/IP retransmissions are all outside
+  the measurement. Reporting it as wire throughput would overstate what was observed.
 
 ### FR-3. Timing
 
-- **FR-3.1.** One request's duration runs from just before the request is sent
+- **FR-3.1.** Every attempt is timed, successful or not, including those ending in
+  an exception: a failure that took 30 s recorded as 0.0 s hides exactly the slow
+  pathologies worth seeing. One request's duration runs from just before the request is sent
   until the response body has been read completely. Monotonic clock
   (`time.monotonic`), not wall-clock: an NTP correction or clock change must not
   distort a measured duration.
@@ -70,13 +96,21 @@ Code `2` is kept distinct from `1` on purpose: "invoked wrong" differs from
   reconnect) drags the mean, and one number alone cannot reveal that it happened.
   Median is the cheapest way to keep the summary honest.
 - **FR-3.4.** Wall time of the whole run is measured separately from the sum of
-  per-request times; the difference exposes overhead (DNS, first handshake).
-- **FR-3.5.** `--timeout` is a deadline on the *whole* request: if the body is not
-  fully read within it, the attempt is failed. This needs stating explicitly
-  because Python's socket timeout bounds only the wait between two reads - with a
-  fast server a 10 MiB download would happily run past a 0.3 s "timeout". The
-  socket timeout is still applied as well, so a hard stall is caught too; the two
-  cover different failures.
+  per-request times; the difference exposes overhead (DNS, first handshake). It is
+  populated by `run()` as well as by the CLI: a default of 0.0 is otherwise
+  indistinguishable from an instantaneous run, and callers of the library API would
+  get a wrong figure while the command line was correct.
+- **FR-3.5.** `--timeout` is a deadline on the *whole* request: connection setup,
+  request write, response header read, and body streaming are all inside it. HTTPX's
+  own connect/read/write/pool timeouts cannot provide this - they are per-phase, and
+  the read timeout resets whenever any byte arrives, so a trickling sender could run
+  arbitrarily long past them (measured: a 2000-write trickle ran 4.4 s under a 0.6 s
+  read timeout). The deadline is therefore enforced with `asyncio.timeout` around the
+  entire exchange, including body consumption; HTTPX's per-phase timeouts remain only
+  as a stall guard.
+
+  Explicitly outside the guarantee: DNS resolution runs in a worker thread inside
+  connect - the deadline fires on time, but the resolver thread may linger past it.
 
 ### FR-4. Data volume
 
@@ -100,6 +134,11 @@ Code `2` is kept distinct from `1` on purpose: "invoked wrong" differs from
   A run where 9 of 10 requests failed must be visible, not hidden.
 - **FR-5.4.** HTTP status outside 2xx counts as a failed request, with the code
   reported. Measuring a 404 page says nothing about serving a heavy asset.
+- **FR-5.4a.** Redirects (3xx with `Location`) are followed, up to 5 hops, and the
+  status that decides success or failure is the **final** response's. A redirect to
+  a missing resource is therefore a failure, while a CDN fronting its asset behind a
+  302 is measured normally. Bounding the hops keeps a self-referential `Location`
+  from hanging the run.
 - **FR-5.5.** Failure reason is a short line (exception type, status code), no
   traceback. Stack traces appear only under `--debug`.
 - **FR-5.6.** If no request succeeded: the summary reports the counts and states
@@ -132,17 +171,22 @@ in documentation that does not add up is worse than no example.
 - **FR-6.3.** Numbers use fixed precision; prefix scale is chosen automatically
   (KiB/MiB/GiB), likewise for the bit version.
 - **FR-6.4.** Results go to `stdout`; warnings and errors to `stderr`. That makes
-  `speedrun URL > out.txt` yield clean data.
+  `speedrun URL > out.txt` yield clean data. Per-request progress lines - including
+  ones marked FAILED - are part of the record and stay on stdout; only operator
+  diagnostics ("nothing to measure", `--debug` detail) go to stderr.
 - **FR-6.5.** Average speed is computed as
   `total_bytes / sum(successful durations)`, **not** as the arithmetic mean of
   per-request speeds. The latter weights a short request the same as a long one.
 
 ## 3. Non-functional requirements
 
-- **NFR-1.** Python >= 3.10, standard library only. For a ~150-line script an
-  external dependency is needless risk in someone else's environment and an
-  extra install step in the run instructions. Implementation uses
-  `urllib.request`; see open decision 1 for the price paid.
+- **NFR-1. Python >= 3.11 (asyncio.timeout) with HTTPX as the single runtime dependency
+  (revised - owner approval recorded in the PR).** The transport was originally
+  stdlib-only on `http.client`; implementing keep-alive, redirect chains and an
+  absolute request deadline by hand grew to 38% of the production code and produced
+  defects of its own (a socket timeout armed on the wrong object, silently doing
+  nothing). HTTPX owns HTTP semantics; this module owns measurement. See section 6,
+  open decision 4.
 - **NFR-2.** Constant memory: response bodies are not accumulated (FR-2.2), so
   peak RSS is independent of resource size.
 - **NFR-3.** The measurement method and its limits are documented in the README:
@@ -151,8 +195,10 @@ in documentation that does not add up is worse than no example.
 - **NFR-4.** Ctrl-C ends the run gracefully: print the summary for requests
   already completed, exit code `130`. A partial measurement beats a lost one.
 - **NFR-5.** Code is typed (`mypy --strict` clean) and linted with `ruff`.
-- **NFR-6.** Networking sits behind a transport interface: the module depends on
-  `Transport.fetch(url, timeout) -> FetchResult`, not on `urllib` directly.
+- **NFR-6.** Networking sits behind a transport interface: orchestration depends on
+  `Transport.fetch(url) -> FetchResult` plus a sync `set_deadline(seconds)`, not on
+  HTTPX directly. The deadline is transport configuration applied before the run
+  starts, which is what keeps timeout parameters out of the async call chain.
   This follows from the verification strategy (section 7): all numeric logic is
   pure functions testable without a network, leaving real HTTP as the single
   unit-untestable part covered by one end-to-end run. Side effect: FR-5.x can be
@@ -196,17 +242,36 @@ by a factor, not by a percentage.
 
 Deliberate trade-offs, not forgotten cases.
 
-1. **stdlib instead of `requests`.** Price: `urllib` cannot transparently report
-   bytes-on-the-wire for a gzip response - `read()` returns inflated data.
-   Resolution: request `Accept-Encoding: identity` (FR-2.5), so received bytes
-   equal the body. `http.client` with manual reads stays a fallback if that ever
-   proves unacceptable.
+1. **stdlib-only was dropped in favour of HTTPX** (supersedes the original decision).
+   The hand-rolled `http.client` transport cost ~300 lines - pooling, redirect hops,
+   a keep-alive retry, socket re-arming, drain - and still shipped two real bugs
+   (a socket timeout armed on an object that exposes no socket, i.e. a silent no-op,
+   and a deadline that trickle streams could outrun through read-buffering). HTTPX
+   provides all of it as supported behaviour; this module keeps only measurement.
+   Price: one dependency and its tree (httpcore, anyio, certifi, h11), and an
+   event loop per run() call.
 2. **Median in the output** goes beyond the literal brief ("average time").
    Kept: without it a single number misleads. Trivially removable.
 3. **The first request includes the handshake** and is therefore slower than the
    rest. No warm-up skip: at N=10 that discards 10% of the sample to hide an
    effect the median already reveals. A `--skip-first` flag is a cheap addition
    if wanted.
+4. **Absolute deadline via asyncio.timeout, not client timeouts.** HTTPX timeouts
+   are per-phase and the read timeout resets on every arrival, so a trickling body is
+   unbounded under them (measured: 4.4 s of trickle under a 0.6 s read timeout).
+   The timeout context manager around the whole exchange, including body consumption,
+   is what makes --timeout absolute. Same non-interruptible phase as before: DNS runs
+   in a worker thread; the deadline fires on time but the resolver may linger.
+5. **No retries, including for the keep-alive stale-connection race.** A server may
+   close an idle connection, or close after accepting the GET but before the response
+   headers; whether it processed the request first is not observable through HTTPX's
+   supported API. A retry would therefore be a second physical GET invisible in the
+   reported request count (FR-2.1), and for a POST-shaped future it would risk a
+   duplicated effect. Two earlier gates - exception-text matching, then "headers not
+   received" - were both rejected in review as proxies that a server-side
+   pre-header close defeats. Consequence: the race surfaces as one failed request in
+   the run summary; `--requests N` is exactly N GETs, verified at the socket level by
+   TestNoSecondPhysicalGet.
 
 ## 7. Verification strategy
 
@@ -225,7 +290,7 @@ possible before code exists and asserts something substantive.
 | `validate_url` | http/https accepted, ftp/scheme-less rejected | FR-1.2 |
 | `parse_args` | defaults N=10 and timeout=30, `-n 0` errors | FR-1.3, FR-1.4 |
 | run loop on fake transport | failures do not abort, excluded from stats | FR-5.1-5.3 |
-| `UrllibTransport.fetch` on stubbed response + injected clock | whole-request deadline, partial bytes dropped | FR-3.5, FR-5.2 |
+| transport on stubbed responses | whole-request deadline, partial bytes dropped | FR-3.5, FR-5.2 |
 | `main` with interrupting transport | exit 130 and partial summary preserved | NFR-4, AC-13 |
 | run loop, all requests fail | exit code 1, `0 ok / N failed` | FR-5.6, AC-3 |
 
@@ -237,5 +302,4 @@ what a mock cannot: FR-2.2 (body read to end) and FR-2.3 (keep-alive).
 hand division) - these verify agreement with reality, not code correctness.
 
 Tests are not required by the brief but ship in the repo: `pytest` runs with one
-command, their only dependency is pytest itself, and the script remains
-dependency-free (NFR-1).
+command. Test-only dependency: pytest. Runtime dependency: HTTPX (NFR-1, revised).
