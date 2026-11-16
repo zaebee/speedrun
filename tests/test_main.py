@@ -27,6 +27,10 @@ class ScriptedTransport:
             raise item
         return item
 
+    def close(self) -> None:
+        """Required by the Transport protocol; the fake holds no resources."""
+        return None
+
 
 def ok(seconds: float, nbytes: int) -> FetchResult:
     return FetchResult(ok=True, seconds=seconds, bytes=nbytes, error=None)
@@ -118,3 +122,67 @@ class TestValidateUrlUnit:
     def test_empty_string_rejected(self) -> None:
         with pytest.raises(UsageError):
             validate_url("")
+
+
+class TestStreamSeparation:
+    """P2-7 / FR-6.4: results on stdout, diagnostics on stderr."""
+
+    def test_successful_run_writes_nothing_to_stderr(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # AC-10 at unit level.
+        t = ScriptedTransport([ok(1.0, 1024)] * 3)
+        main(["https://x/y", "-n", "3"], transport=t)
+        assert capsys.readouterr().err == ""
+
+    def test_failure_reason_is_a_result_not_a_diagnostic(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # A failed request's progress line is part of the measurement record and
+        # belongs on stdout; only "we could not measure" is a diagnostic.
+        t = ScriptedTransport([bad(0.1, "HTTP 404"), ok(1.0, 10)])
+        main(["https://x/y", "-n", "2"], transport=t)
+        captured = capsys.readouterr()
+        assert "FAILED" in captured.out
+        assert captured.err == ""
+
+    def test_total_failure_message_goes_to_stderr(self, capsys: pytest.CaptureFixture[str]) -> None:
+        t = ScriptedTransport([bad(0.1, "HTTP 503")])
+        main(["https://x/y", "-n", "2"], transport=t)
+        captured = capsys.readouterr()
+        assert "nothing to measure" in captured.err
+        assert "not measured" in captured.out
+
+    def test_usage_error_goes_to_stderr_only(self, capsys: pytest.CaptureFixture[str]) -> None:
+        main(["ftp://x/y"])
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "invalid URL" in captured.err
+
+    def test_debug_flag_adds_stderr_line_without_touching_stdout(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        t = ScriptedTransport([bad(0.1, "HTTP 404"), ok(1.0, 10)])
+        main(["https://x/y", "-n", "2", "--debug"], transport=t)
+        captured = capsys.readouterr()
+        assert "request 1 failed" in captured.err
+        # Diagnostics must not leak into the results stream. Match on the
+        # diagnostic prefix rather than the bare word "request", which also
+        # appears in the summary's "... s in requests" annotation.
+        assert not [ln for ln in captured.out.splitlines() if ln.startswith("speedrun:")]
+
+
+class TestTimeoutValidation:
+    """P2-5 / FR-1.5: nonsense timeouts are usage errors, not silent misbehavior."""
+
+    @pytest.mark.parametrize("value", ["0", "-1", "nan", "inf", "-inf", "1e999", "abc"])
+    def test_rejected_with_exit_two(self, value: str) -> None:
+        with pytest.raises(SystemExit) as excinfo:
+            main(["https://x/y", "--timeout", value])
+        assert excinfo.value.code == 2
+
+    @pytest.mark.parametrize("value", ["0.001", "1", "30", "3600.5"])
+    def test_positive_finite_accepted(self, value: str) -> None:
+        from speedrun import parse_args
+
+        assert parse_args(["u", "--timeout", value]).timeout == float(value)

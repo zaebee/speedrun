@@ -40,6 +40,10 @@ Validation:
   no network request is made.
 - **FR-1.3.** `--requests < 1` -> usage error, exit code `2`.
 - **FR-1.4.** Unknown flag -> standard argparse message, exit code `2`.
+- **FR-1.5.** `--timeout` must be finite and > 0; zero, negative, NaN and infinity
+  are usage errors with exit code `2`. Zero would fail every attempt for a reason
+  the user cannot see, and NaN silently disables the deadline comparison
+  (`now() > nan` is always false).
 
 Code `2` is kept distinct from `1` on purpose: "invoked wrong" differs from
 "could not measure".
@@ -55,13 +59,19 @@ Code `2` is kept distinct from `1` on purpose: "invoked wrong" differs from
   TCP+TLS handshake lands in every sample and the result measures something
   other than what was asked. A deliberate measurement-model choice, see NFR-3.
 - **FR-2.4.** No delay between requests.
-- **FR-2.5.** `Accept-Encoding` is pinned to `identity`; bodies are requested
-  uncompressed so that bytes-on-the-wire equal body size (see FR-4.3 and open
-  decision 1).
+- **FR-2.5.** `Accept-Encoding` is pinned to `identity`, so the counted volume is
+  the response body as delivered, with no decoding step in between (see FR-4.3 and
+  open decision 1).
+- **FR-4.5.** Terminology is fixed by this: the measured quantity is **HTTP response
+  payload**. It is not "bytes on the wire" - request/response headers, chunked
+  transfer framing, TLS record overhead and TCP/IP retransmissions are all outside
+  the measurement. Reporting it as wire throughput would overstate what was observed.
 
 ### FR-3. Timing
 
-- **FR-3.1.** One request's duration runs from just before the request is sent
+- **FR-3.1.** Every attempt is timed, successful or not, including those ending in
+  an exception: a failure that took 30 s recorded as 0.0 s hides exactly the slow
+  pathologies worth seeing. One request's duration runs from just before the request is sent
   until the response body has been read completely. Monotonic clock
   (`time.monotonic`), not wall-clock: an NTP correction or clock change must not
   distort a measured duration.
@@ -100,6 +110,11 @@ Code `2` is kept distinct from `1` on purpose: "invoked wrong" differs from
   A run where 9 of 10 requests failed must be visible, not hidden.
 - **FR-5.4.** HTTP status outside 2xx counts as a failed request, with the code
   reported. Measuring a 404 page says nothing about serving a heavy asset.
+- **FR-5.4a.** Redirects (3xx with `Location`) are followed, up to 5 hops, and the
+  status that decides success or failure is the **final** response's. A redirect to
+  a missing resource is therefore a failure, while a CDN fronting its asset behind a
+  302 is measured normally. Bounding the hops keeps a self-referential `Location`
+  from hanging the run.
 - **FR-5.5.** Failure reason is a short line (exception type, status code), no
   traceback. Stack traces appear only under `--debug`.
 - **FR-5.6.** If no request succeeded: the summary reports the counts and states
@@ -132,7 +147,9 @@ in documentation that does not add up is worse than no example.
 - **FR-6.3.** Numbers use fixed precision; prefix scale is chosen automatically
   (KiB/MiB/GiB), likewise for the bit version.
 - **FR-6.4.** Results go to `stdout`; warnings and errors to `stderr`. That makes
-  `speedrun URL > out.txt` yield clean data.
+  `speedrun URL > out.txt` yield clean data. Per-request progress lines - including
+  ones marked FAILED - are part of the record and stay on stdout; only operator
+  diagnostics ("nothing to measure", `--debug` detail) go to stderr.
 - **FR-6.5.** Average speed is computed as
   `total_bytes / sum(successful durations)`, **not** as the arithmetic mean of
   per-request speeds. The latter weights a short request the same as a long one.
@@ -196,8 +213,10 @@ by a factor, not by a percentage.
 
 Deliberate trade-offs, not forgotten cases.
 
-1. **stdlib instead of `requests`.** Price: `urllib` cannot transparently report
-   bytes-on-the-wire for a gzip response - `read()` returns inflated data.
+1. **stdlib instead of `requests`.** Price: `urllib.request` cannot report an
+   undecoded body for a gzip response - `read()` returns inflated data - and it also
+   forces `Connection: close`, so it cannot keep a session alive at all. Both are why
+   the transport is built on `http.client` directly.
    Resolution: request `Accept-Encoding: identity` (FR-2.5), so received bytes
    equal the body. `http.client` with manual reads stays a fallback if that ever
    proves unacceptable.

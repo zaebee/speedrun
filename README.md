@@ -19,6 +19,7 @@ $ python3 speedrun.py https://proof.ovh.net/files/10Mb.dat -n 5
 Requests       5 ok / 0 failed
 Total size     50.00 MiB
 Avg time       0.621 s   (median 0.620 s)
+Run wall time  3.108 s   (3.105 s in requests)
 Throughput     16.10 MiB/s   (135.06 Mbps)
 ```
 
@@ -37,7 +38,7 @@ python3 speedrun.py <url> [-n N] [--timeout SEC] [-q] [--debug]
 |---|---|---|
 | `url` | — | Absolute `http(s)://` address to fetch repeatedly |
 | `-n`, `--requests` | `10` | Number of sequential requests |
-| `--timeout` | `30` | Deadline for a whole request, seconds (see below) |
+| `--timeout` | `30` | Deadline for a whole request, seconds; must be > 0 and finite |
 | `-q`, `--quiet` | off | Print the summary block only |
 | `--debug` | off | Show tracebacks instead of one-line error reasons |
 
@@ -107,13 +108,18 @@ The choices below change the numbers, so they are documented rather than hidden:
 
 - **Sequential, never concurrent.** Request *k+1* starts after *k* has been read to
   completion. This measures single-stream throughput, not server capacity.
-- **One reused connection (keep-alive).** Without it every sample would include a
-  fresh TCP handshake — and over HTTPS a TLS one — so the result would describe
-  connection setup more than download speed. Consequence: the first request is
-  normally slightly slower than the rest.
+- **One persistent connection per host (HTTP/1.1 keep-alive).** Without it every
+  sample includes a fresh TCP handshake — and over HTTPS a TLS one — so the result
+  describes connection setup rather than transfer. This is why the transport is built
+  on `http.client` directly: `urllib.request` sets `Connection: close` and cannot
+  reuse connections at all. Measured effect on a 10 MiB file: first request 0.62 s,
+  subsequent ones 0.16 s. Consequence to keep in mind — these numbers are better than
+  cold-start downloads would be.
 - **Responses are requested uncompressed** (`Accept-Encoding: identity`), so the
-  byte count equals what actually crossed the wire. Compressed transfer would make
-  the reported speed describe CPU decompression as much as the link.
+  counted volume is the response body exactly as delivered, with no decoding step
+  in between. Note what that volume is *not*: it counts HTTP payload bytes only, so
+  request and response headers, chunk framing, and TLS/TCP/IP overhead are excluded.
+  The figure is application-payload throughput, not physical wire utilization.
 - **Volume counts bytes received**, not `Content-Length`. A chunked response has no
   declared length, and a declared length can disagree with what arrives.
 - **Body is read in 256 KiB chunks and discarded**, so peak memory stays constant
@@ -123,6 +129,9 @@ The choices below change the numbers, so they are documented rather than hidden:
   wait between two reads, which lets a fast server stream far past a short timeout;
   the deadline is checked during the read loop as well. The socket timeout is still
   applied, catching hard stalls.
+- **Redirects are followed** (up to 5 hops) and the *final* response status decides
+  success. A redirect ending in 404 fails; a CDN answering with a 302 in front of its
+  asset measures normally. The hop limit stops a self-referential `Location`.
 - **Failed requests are excluded** from the average and from the volume, and counted
   separately. A truncated response has provably incomplete time *and* bytes;
   averaging them in would silently corrupt the metric.

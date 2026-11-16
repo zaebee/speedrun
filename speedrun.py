@@ -11,17 +11,17 @@ Behaviour is specified in SPEC.md. Standard library only; no third-party deps.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import http.client
+import math
 import statistics
 import sys
 import time
-import traceback
-import urllib.error
-import urllib.request
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from enum import IntEnum
 from typing import Any, Protocol
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 # --- Units (SPEC section 5) --------------------------------------------------
 
@@ -71,6 +71,11 @@ class Summary:
     avg_seconds: float
     median_seconds: float
     throughput_bytes_per_sec: float
+    # Elapsed time of the whole run, measured independently of the request
+    # durations above. The gap between them is overhead (DNS, first handshake,
+    # Python startup per request) and is the point of FR-3.4 - deriving it from
+    # the sum would make the metric tautological.
+    wall_seconds: float = 0.0
 
 
 # --- Pure numeric logic (unit-tested without a network) -----------------------
@@ -185,6 +190,25 @@ def positive_int(value: str) -> int:
     return n
 
 
+def positive_finite(value: str) -> float:
+    """argparse type for --timeout: a finite number > 0 (FR-1.5).
+
+    Zero and negatives are rejected because the whole-request deadline would then
+    fail every attempt - a confusing run rather than a clear usage error. NaN and
+    infinities are rejected because they corrupt the deadline comparison silently:
+    `now() > nan` is always False, so the deadline would never fire.
+    """
+    try:
+        n = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a number of seconds, got {value!r}") from None
+    if not math.isfinite(n):
+        raise argparse.ArgumentTypeError(f"--timeout must be finite, got {value!r}")
+    if n <= 0:
+        raise argparse.ArgumentTypeError(f"--timeout must be greater than 0, got {n:g}")
+    return n
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="speedrun",
@@ -201,7 +225,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--timeout",
-        type=float,
+        type=positive_finite,
         default=30.0,
         metavar="SEC",
         help="per-request timeout in seconds (default: 30)",
@@ -232,63 +256,231 @@ class Transport(Protocol):
 
     def fetch(self, url: str, timeout: float) -> FetchResult: ...
 
+    def close(self) -> None: ...
+
 
 @dataclass
-class UrllibTransport:
-    """Real transport on top of ``urllib.request``, reusing one connection pool.
+class HttpTransport:
+    """Real transport on ``http.client`` with one persistent connection per host.
 
-    Session reuse matters for what we measure (FR-2.3): without keep-alive every
-    sample would include a fresh TCP handshake - and, over https, a TLS one - so
-    the number would describe connection setup rather than download speed.
+    Why not ``urllib.request``: its handler sets ``Connection: close`` and closes
+    the socket after every response, so it cannot reuse connections at all. The
+    measurement we advertise is single-stream throughput *after* setup (FR-2.3),
+    which requires keep-alive; a local-server test counts accepted TCP sockets to
+    prove it, since comparing request durations proves nothing.
 
-    ``now`` is injectable so the deadline logic can be tested against scripted
-    time instead of sleeping.
+    Redirects are followed by hand rather than via urllib's opener, so the status
+    that decides success or failure is the final response's (FR-5.4a).
+
+    ``now`` is injectable so the deadline logic is tested against scripted time
+    instead of sleeping.
     """
 
-    opener: Any = None
     now: Callable[[], float] = time.monotonic
+    conn_factory: Callable[..., Any] | None = None
+
+    _connections: dict[tuple[str, int], Any] = field(default_factory=dict, repr=False)
 
     def __post_init__(self) -> None:
-        if self.opener is None:
-            self.opener = urllib.request.build_opener()
+        if self.conn_factory is None:
+            self.conn_factory = _default_connection
+
+    # -- public API -----------------------------------------------------------
 
     def fetch(self, url: str, timeout: float) -> FetchResult:
-        # identity encoding keeps received bytes equal to the body, so the volume
-        # reported really is what crossed the wire (FR-2.5, open decision 1).
-        request = urllib.request.Request(url, headers={"Accept-Encoding": "identity"})
         start = self.now()
-        size = 0
-        status: int | None = None
-        try:
-            with self.opener.open(request, timeout=timeout) as response:
-                status = int(getattr(response, "status", None) or response.getcode())
-                while True:
-                    # Read in chunks and discard: buffering the whole body would
-                    # make peak memory grow with the resource (NFR-2, FR-2.2).
-                    chunk = response.read(_CHUNK)
-                    if not chunk:
-                        break
-                    size += len(chunk)
-                    # The socket timeout only bounds the wait between reads, so a
-                    # fast server could stream past --timeout forever. Enforce it
-                    # as a deadline on the whole request (FR-3.5).
-                    elapsed = self.now() - start
-                    if elapsed > timeout:
-                        return FetchResult(
-                            ok=False,
-                            seconds=elapsed,
-                            bytes=0,
-                            error=f"exceeded {timeout:g} s deadline after {format_bytes(size)}",
-                        )
-        except urllib.error.HTTPError as exc:
-            # A non-2xx answer says nothing about serving a heavy asset (FR-5.4).
-            return FetchResult(
-                ok=False, seconds=self.now() - start, bytes=0, error=f"HTTP {exc.code}"
+        deadline = start + timeout
+        target = url
+        for hop in range(_MAX_REDIRECTS + 1):
+            result, redirect = self._fetch_one(target, deadline, start)
+            if redirect is not None:
+                target = redirect
+                continue
+            if hop == _MAX_REDIRECTS and result.error == "too many redirects":
+                return result
+            return result
+        return FetchResult(ok=False, seconds=self.now() - start, bytes=0, error="unreachable")
+
+    def close(self) -> None:
+        # Best effort: a socket already broken by the peer still has to be released
+        # locally, and shutdown must not raise on account of it.
+        for conn in self._connections.values():
+            with contextlib.suppress(OSError):
+                conn.close()
+        self._connections.clear()
+
+    # -- internals ------------------------------------------------------------
+
+    def _fetch_one(self, url: str, deadline: float, start: float) -> tuple[FetchResult, str | None]:
+        scheme, host, port, path = _split_url(url)
+        if deadline - self.now() <= 0:
+            return (
+                FetchResult(
+                    ok=False,
+                    seconds=self.now() - start,
+                    bytes=0,
+                    error=f"exceeded {deadline - start:.0f} s deadline before sending",
+                ),
+                None,
             )
+        try:
+            response = self._exchange_resilient(scheme, host, port, path, deadline)
+        except Exception as exc:
+            return self._failure(exc, start), None
+
+        status = int(response.status)
+        location = response.getheader("Location")
+        if 300 <= status < 400 and location:
+            # Drain before reuse, otherwise the next request on this connection
+            # would read the redirect's body as its own.
+            self._drain(response)
+            return FetchResult(ok=True, seconds=0.0, bytes=0, error=None), _absolute(url, location)
+
+        size, timed_out = self._read_body(response, deadline)
         seconds = self.now() - start
-        if status is not None and not 200 <= status < 300:
-            return FetchResult(ok=False, seconds=seconds, bytes=0, error=f"HTTP {status}")
-        return FetchResult(ok=True, seconds=seconds, bytes=size, error=None)
+        if timed_out:
+            self._drop((host, port))
+            return (
+                FetchResult(
+                    ok=False,
+                    seconds=seconds,
+                    bytes=0,
+                    error=f"exceeded deadline after {format_bytes(size)}",
+                ),
+                None,
+            )
+        if not 200 <= status < 300:
+            return (
+                FetchResult(ok=False, seconds=seconds, bytes=0, error=f"HTTP {status}"),
+                None,
+            )
+        return FetchResult(ok=True, seconds=seconds, bytes=size, error=None), None
+
+    def _read_body(self, response: Any, deadline: float) -> tuple[int, bool]:
+        """Read to EOF, returning (payload bytes, deadline_exceeded).
+
+        The deadline is checked after *every* read including the one that returns
+        EOF: an empty final read that lands late is still a missed deadline, and
+        checking only after non-empty chunks would report such a response as a
+        success (FR-3.5). Each blocking read is bounded by the time left, so a
+        stall cannot outlive the deadline either.
+        """
+        size = 0
+        while True:
+            remaining = deadline - self.now()
+            if remaining <= 0:
+                return size, True
+            # Bound the blocking read itself by what is left of the deadline, so a
+            # stalled transfer cannot outlive it between chunks (FR-3.5).
+            _set_socket_timeout(response, remaining)
+            try:
+                chunk = response.read(_CHUNK)
+            except TimeoutError:
+                return size, True
+            if not chunk:
+                # EOF reached, but if that final read arrived late the deadline was
+                # still missed - checking only after non-empty chunks would call
+                # this a success.
+                return size, self.now() > deadline
+            size += len(chunk)
+            if self.now() > deadline:
+                return size, True
+
+    @staticmethod
+    def _drain(response: Any) -> None:
+        try:
+            while response.read(65_536):
+                pass
+        except Exception:
+            pass
+
+    def _exchange_resilient(
+        self, scheme: str, host: str, port: int, path: str, deadline: float
+    ) -> Any:
+        """GET with one transparent retry on a stale pooled connection.
+
+        Keep-alive has a known race: the server may close an idle connection at any
+        moment, and the client only finds out when it writes to or reads from it.
+        That surfaces as RemoteDisconnected on the first request after an idle
+        period - not a real failure, so it is retried once on a fresh socket.
+        Anything else propagates and becomes this request's outcome.
+        """
+        try:
+            return self._exchange(scheme, host, port, path, deadline)
+        except Exception as exc:
+            dropped = self._drop((host, port))
+            if not (dropped and self._is_reusable_error(exc)):
+                raise
+            return self._exchange(scheme, host, port, path, deadline)
+
+    def _exchange(self, scheme: str, host: str, port: int, path: str, deadline: float) -> Any:
+        """Send one GET on a pooled connection and return the response object."""
+        conn = self._connection(scheme, host, port, deadline)
+        conn.request("GET", path, headers={"Accept-Encoding": "identity"})
+        return conn.getresponse()
+
+    def _connection(self, scheme: str, host: str, port: int, deadline: float) -> Any:
+        key = (host, port)
+        conn = self._connections.get(key)
+        if conn is None:
+            assert self.conn_factory is not None
+            conn = self.conn_factory(scheme, host, port, max(0.1, deadline - self.now()))
+            self._connections[key] = conn
+        return conn
+
+    def _drop(self, key: tuple[str, int]) -> bool:
+        conn = self._connections.pop(key, None)
+        if conn is None:
+            return False
+        with contextlib.suppress(OSError):
+            conn.close()
+        return True
+
+    @staticmethod
+    def _is_reusable_error(exc: BaseException) -> bool:
+        return isinstance(
+            exc, (http.client.RemoteDisconnected, ConnectionResetError, BrokenPipeError)
+        )
+
+    def _failure(self, exc: BaseException, start: float) -> FetchResult:
+        """A failed attempt: real elapsed time, no bytes credited."""
+        return FetchResult(ok=False, seconds=self.now() - start, bytes=0, error=_reason(exc))
+
+
+_MAX_REDIRECTS = 5
+
+
+def _default_connection(scheme: str, host: str, port: int, timeout: float) -> Any:
+    cls = http.client.HTTPSConnection if scheme == "https" else http.client.HTTPConnection
+    return cls(host, port, timeout=timeout)
+
+
+def _set_socket_timeout(response: Any, seconds: float) -> None:
+    """Re-arm the underlying socket for one read of at most ``seconds``.
+
+    ``http.client`` exposes no public API for this; reaching for the socket is the
+    only way to bound a blocking read by a *remaining* deadline rather than by the
+    original full timeout. Guarded so an unexpected response object (a test fake)
+    degrades to leaving the timeout as-is instead of crashing.
+    """
+    sock = getattr(getattr(response, "fp", None), "_sock", None) or getattr(response, "sock", None)
+    if sock is not None:
+        with contextlib.suppress(OSError, ValueError):
+            sock.settimeout(max(0.001, seconds))
+
+
+def _split_url(url: str) -> tuple[str, str, int, str]:
+    parsed = urlparse(url)
+    scheme = parsed.scheme
+    port = parsed.port or (443 if scheme == "https" else 80)
+    path = parsed.path or "/"
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+    return scheme, str(parsed.hostname), port, path
+
+
+def _absolute(base: str, location: str) -> str:
+    return urljoin(base, location)
 
 
 # --- Run loop -----------------------------------------------------------------
@@ -310,6 +502,25 @@ def _progress_line(index: int, total: int, result: FetchResult) -> str:
     return f"{label} FAILED    {result.seconds:7.3f} s   {result.error or 'error'}"
 
 
+def _attempt(
+    transport: Transport, url: str, timeout: float, now: Callable[[], float]
+) -> FetchResult:
+    """Run one request, converting any transport exception into a failed result.
+
+    The duration is measured here, around the call, so it is real on both paths:
+    a failure that took 30 s must not be recorded as 0.0 s (FR-3.1). Exceptions
+    escaping ``fetch`` are unexpected ones - the transport's own contract is to
+    report ordinary network failures as a failed result.
+    """
+    start = now()
+    try:
+        return transport.fetch(url, timeout)
+    except KeyboardInterrupt:
+        raise
+    except Exception as exc:  # any transport failure is one bad request, not fatal
+        return FetchResult(ok=False, seconds=now() - start, bytes=0, error=_reason(exc))
+
+
 def run(
     url: str,
     requests: int,
@@ -317,6 +528,7 @@ def run(
     transport: Transport,
     quiet: bool = False,
     emit: Emit | None = None,
+    now: Callable[[], float] = time.monotonic,
 ) -> Summary:
     """Perform ``requests`` sequential fetches and aggregate the result.
 
@@ -326,10 +538,7 @@ def run(
     writer: Emit = emit if emit is not None else print
     results: list[FetchResult] = []
     for index in range(1, requests + 1):
-        try:
-            result = transport.fetch(url, timeout)
-        except Exception as exc:  # any transport failure is one bad request, not a fatal run
-            result = FetchResult(ok=False, seconds=0.0, bytes=0, error=_reason(exc))
+        result = _attempt(transport, url, timeout, now)
         results.append(result)
         if not quiet:
             writer(_progress_line(index, requests, result))
@@ -351,6 +560,7 @@ def format_summary(s: Summary) -> list[str]:
         [
             f"{'Total size':<15}{format_bytes(s.total_bytes)}",
             f"{'Avg time':<15}{s.avg_seconds:.3f} s   (median {s.median_seconds:.3f} s)",
+            f"{'Run wall time':<15}{s.wall_seconds:.3f} s   ({s.total_seconds:.3f} s in requests)",
             (
                 f"{'Throughput':<15}{format_bytes(s.throughput_bytes_per_sec)}/s"
                 f"   ({format_bitrate(s.throughput_bytes_per_sec)})"
@@ -363,6 +573,28 @@ def format_summary(s: Summary) -> list[str]:
 # --- Entry point --------------------------------------------------------------
 
 
+def _collect(
+    transport: Transport, url: str, args: argparse.Namespace
+) -> tuple[list[FetchResult], bool]:
+    """Run requests until done or interrupted, returning (results, was_interrupted).
+
+    Kept separate from main() so the interrupt handling - the only reason this
+    loop cannot just call run() - is one small readable function.
+    """
+    results: list[FetchResult] = []
+    for index in range(1, args.requests + 1):
+        try:
+            result = _attempt(transport, url, args.timeout, time.monotonic)
+        except KeyboardInterrupt:
+            return results, True
+        results.append(result)
+        if not args.quiet:
+            print(_progress_line(index, args.requests, result))
+        if args.debug and not result.ok:
+            print(f"speedrun: request {index} failed: {result.error}", file=sys.stderr)
+    return results, False
+
+
 def main(argv: Sequence[str] | None = None, transport: Transport | None = None) -> int:
     args = parse_args(argv)
     try:
@@ -371,29 +603,16 @@ def main(argv: Sequence[str] | None = None, transport: Transport | None = None) 
         print(f"speedrun: error: {exc}", file=sys.stderr)
         return int(ExitCode.USAGE)
 
-    # Injectable for tests; production uses the real urllib transport.
-    active: Transport = transport if transport is not None else UrllibTransport()
-    results: list[FetchResult] = []
-    interrupted = False
+    # Injectable for tests; production uses the real keep-alive transport.
+    active: Transport = transport if transport is not None else HttpTransport()
+    started = time.monotonic()
+    try:
+        results, interrupted = _collect(active, url, args)
+    finally:
+        active.close()
+    wall = time.monotonic() - started
 
-    # The loop is spelled out here instead of calling run() so that Ctrl-C can
-    # hand back whatever has already been measured (NFR-4, AC-13).
-    for index in range(1, args.requests + 1):
-        try:
-            try:
-                result = active.fetch(url, args.timeout)
-            except Exception as exc:  # one bad request is not a fatal run
-                result = FetchResult(ok=False, seconds=0.0, bytes=0, error=_reason(exc))
-                if args.debug:
-                    traceback.print_exc()
-        except KeyboardInterrupt:
-            interrupted = True
-            break
-        results.append(result)
-        if not args.quiet:
-            print(_progress_line(index, args.requests, result))
-
-    summary = summarize(results)
+    summary = replace(summarize(results), wall_seconds=wall)
     if not args.quiet:
         print()
     for line in format_summary(summary):

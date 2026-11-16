@@ -13,8 +13,10 @@ from speedrun import (
     ExitCode,
     FetchResult,
     Transport,
+    _attempt,
     exit_code_for,
     format_summary,
+    main,
     run,
     summarize,
 )
@@ -33,6 +35,9 @@ class FakeTransport(Transport):
         if isinstance(item, Exception):
             raise item
         return item
+
+    def close(self) -> None:
+        """Transport protocol requires it; the fake holds no resources."""
 
 
 def ok(seconds: float, nbytes: int) -> FetchResult:
@@ -157,3 +162,128 @@ class TestNoInventedNumbers:
         joined = "\n".join(format_summary(s))
         assert "not measured" not in joined
         assert "1.00 KiB" in joined
+
+
+class TestExceptionDurationsAreReal:
+    """P2-4: a failed attempt must carry the time it actually took."""
+
+    def test_exception_path_is_timed_not_fabricated(self) -> None:
+        # The old code wrote seconds=0.0 for exceptions, hiding slow failures.
+        # Injected clock makes "the failure took 12.5 s" exact and fast.
+        clock = {"t": 0.0}
+
+        def now() -> float:
+            return clock["t"]
+
+        class SlowFail:
+            def fetch(self, url: str, timeout: float) -> FetchResult:
+                clock["t"] += 12.5
+                raise ConnectionError("reset by peer")
+
+            def close(self) -> None:
+                return None
+
+        result = _attempt(SlowFail(), "https://x/y", 30.0, now)
+        assert result.ok is False
+        assert result.seconds == pytest.approx(12.5)
+        assert "ConnectionError" in (result.error or "")
+
+    def test_run_loop_propagates_measured_failure_time(self) -> None:
+        clock = {"t": 0.0}
+
+        def now() -> float:
+            return clock["t"]
+
+        class FailAfter:
+            def __init__(self, delay: float) -> None:
+                self.delay = delay
+
+            def fetch(self, url: str, timeout: float) -> FetchResult:
+                clock["t"] += self.delay
+                raise TimeoutError("stalled")
+
+            def close(self) -> None:
+                return None
+
+        seen: list[FetchResult] = []
+        run(
+            "https://x/y",
+            requests=2,
+            timeout=30.0,
+            transport=FailAfter(3.0),
+            quiet=False,
+            now=now,
+            emit=lambda line: seen.append(line),
+        )
+        # FR-5.2 keeps failures out of total_seconds on purpose; the per-attempt
+        # duration still has to be real, which is what the progress line shows.
+        assert len(seen) == 2
+        assert all("3.000 s" in line for line in seen), seen
+
+    def test_attempt_times_the_exception_path(self) -> None:
+        import time as _time
+
+        class Sleeping:
+            def fetch(self, url: str, timeout: float) -> FetchResult:
+                _time.sleep(0.05)
+                raise TimeoutError("slow failure")
+
+            def close(self) -> None:
+                return None
+
+        result = _attempt(Sleeping(), "https://x/y", 30.0, _time.monotonic)
+        assert result.ok is False
+        assert result.seconds >= 0.04  # measured, not fabricated
+
+
+class TestWallClockIsIndependent:
+    """P2-3 / FR-3.4: run wall time is its own metric, not a sum of durations."""
+
+    def test_summary_exposes_wall_seconds(self) -> None:
+        s = summarize([ok(1.0, 10)])
+        assert hasattr(s, "wall_seconds")
+
+    def test_main_reports_wall_time_above_request_sum(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # FR-3.4: wall time is measured around the whole run, so any gap between
+        # requests (transport setup, Python overhead) shows up there and nowhere
+        # else. A transport that sleeps outside fetch() makes the two differ.
+        import time as _time
+
+        class Gappy:
+            def __init__(self) -> None:
+                self.n = 0
+
+            def fetch(self, url: str, timeout: float) -> FetchResult:
+                self.n += 1
+                if self.n > 1:
+                    _time.sleep(0.05)  # cost incurred before the timed request
+                return ok(0.01, 100)
+
+            def close(self) -> None:
+                return None
+
+        main(["https://x/y", "-n", "2"], transport=Gappy())
+        out = capsys.readouterr().out
+        # "Run wall time   X s   (Y s in requests)" with X > Y.
+        import re
+
+        line = next(ln for ln in out.splitlines() if "Run wall time" in ln)
+        numbers = [float(x) for x in re.findall(r"([\d.]+) s", line)]
+        assert len(numbers) == 2, line
+        wall, inside = numbers
+        assert wall > inside
+
+
+class TestStreamSeparation:
+    """P2-7 / FR-6.4: diagnostics on stderr, results on stdout."""
+
+    def test_progress_and_summary_are_stdout_only(self) -> None:
+        # Asserted at the main() level in test_main.py; here we pin the contract
+        # that run()'s emit callback receives every progress line.
+        lines: list[str] = []
+        t = FakeTransport([ok(1.0, 10), failed(0.1, "HTTP 404")])
+        run("https://x/y", 2, 5.0, t, quiet=False, emit=lines.append)
+        assert len(lines) == 2
+        assert any("FAILED" in ln for ln in lines)
