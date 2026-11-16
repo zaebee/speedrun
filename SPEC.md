@@ -50,8 +50,18 @@ Code `2` is kept distinct from `1` on purpose: "invoked wrong" differs from
 
 ### FR-2. Request sequence
 
-- **FR-2.1.** Exactly `N` requests, strictly one after another. The next starts
-  only once the previous has fully completed or been recorded as failed.
+- **FR-2.1.** `--requests N` means exactly `N` sequential **top-level fetch
+  attempts**, one after another: the next starts only once the previous has fully
+  completed or been recorded as failed. A failed attempt is reported as failed;
+  the tool performs no automatic retries.
+
+  Counting model: redirect hops are internal to a fetch attempt and are handled by
+  HTTPX, so an attempt that meets a redirecting server may comprise several
+  physical HTTP requests on the same connection (bounded by 5 hops, FR-5.4a).
+  One attempt is therefore not universally one physical GET; what is guaranteed is
+  N attempts, no hidden retries, and - absent redirects on the target - one
+  physical GET per attempt, pinned by `TestNoSecondPhysicalGet` at the socket
+  level for the pre-header-failure case.
 - **FR-2.2.** Each response is read to the end. This requirement is substantive:
   a connection with an unread body is not a complete exchange and its volume is
   unknown. The body is read in chunks and discarded, never buffered whole.
@@ -60,10 +70,10 @@ Code `2` is kept distinct from `1` on purpose: "invoked wrong" differs from
   other than what was asked. A deliberate measurement-model choice, see NFR-3.
   Known consequence, documented rather than hidden: the keep-alive stale-connection
   race (server closes an idle connection, possibly after processing the request) is
-  reported as one failed request. No retry is attempted - see open decision 5.
-  Verified by counting accepted TCP sockets: N requests must yield N or fewer
-  connections, and one logical request is exactly one physical GET
-  (TestNoSecondPhysicalGet).
+  reported as one failed attempt. No retry is attempted - see open decision 5.
+  Connection reuse is verified by counting accepted TCP sockets on a local server:
+  N attempts against one non-redirecting host must yield one connection
+  (TestConnectionReuse).
 - **FR-2.4.** No delay between requests.
 - **FR-2.5.** `Accept-Encoding` is pinned to `identity`, so the counted volume is
   the response body as delivered, with no decoding step in between (see FR-4.3 and

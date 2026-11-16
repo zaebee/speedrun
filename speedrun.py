@@ -336,7 +336,7 @@ class HttpTransport:
             # exchange at the budget's end wherever it happens to be blocked - connect,
             # headers, or mid-body. HTTPX's per-phase timeouts are only a stall guard.
             async with asyncio.timeout(self.timeout):
-                size, status = await self._exchange(url)
+                size, status = await self._stream_once(url)
         except TimeoutError:
             # The deliberate outcome for any exchange slower than --timeout.
             elapsed = self.now() - start
@@ -363,21 +363,18 @@ class HttpTransport:
             return FetchResult(ok=False, seconds=seconds, bytes=0, error=f"HTTP {status}")
         return FetchResult(ok=True, seconds=seconds, bytes=size, error=None)
 
-    async def _exchange(self, url: str) -> tuple[int, int]:
+    async def _stream_once(self, url: str) -> tuple[int, int]:
         """Stream one response to completion; return (payload bytes, final status).
 
-        No retries, deliberately. The keep-alive stale-connection race - a server
-        closing an idle connection, or closing after accepting the GET but before
-        the response headers - surfaces as one failed request, and that is the
-        honest result: whether the server processed the request before closing is
-        not observable through HTTPX's supported API, so a retry here would be a
-        second physical GET invisible in the reported request count (FR-2.1). The
-        failure is visible in the run summary instead, which is what a measurement
-        tool owes its operator. See SPEC FR-2.3 and open decision 5.
+        No retries, deliberately (SPEC FR-2.1, open decision 5). The keep-alive
+        stale-connection race - a server closing an idle connection, or closing
+        after accepting the GET but before the response headers - surfaces as one
+        failed attempt, and that is the honest result: whether the server processed
+        the request before closing is not observable through HTTPX's supported API,
+        so a retry would be a second physical GET invisible in the reported request
+        count. The failure is visible in the run summary instead, which is what a
+        measurement tool owes its operator.
         """
-        return await self._stream_once(url)
-
-    async def _stream_once(self, url: str) -> tuple[int, int]:
         client = self._get_client()
         # Per-phase timeouts cap each blocking step at the budget; the absolute
         # bound is asyncio.timeout in fetch(). Without them a stalled step could

@@ -146,12 +146,13 @@ class TestFailureIsolation:
 
 
 class TestNoSecondPhysicalGet:
-    """FR-2.1 at the socket level: one logical request is exactly one GET.
+    """FR-2.1 at the socket level, for the no-redirect case: one attempt is one GET.
 
     The audit's requested regression: a server that accepts the request and closes
     before response headers. The failure is reported; no second GET is issued - the
     historical retry (text-heuristic, then headers-not-received gate) would both
-    have issued one here.
+    have issued one here. With redirects enabled an attempt may legitimately span
+    several physical requests (FR-2.1, counting model); this server issues none.
     """
 
     def test_pre_header_close_fails_without_a_second_request(self) -> None:

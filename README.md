@@ -129,10 +129,10 @@ The choices below change the numbers, so they are documented rather than hidden:
 - **Volume counts bytes received**, not `Content-Length`. A chunked response has no
   declared length, and a declared length can disagree with what arrives.
 - **Body is streamed in 64 KiB chunks and discarded**, so peak memory stays constant
-  regardless of resource size. Verified: downloading a 100 MiB file uses the same
-  identical peak RSS (~33 MB, mostly the interpreter) as a 10 MiB one. Measured by
-  `tests/test_memory.py`, which also asserts both downloads really transferred their
-  full payload — without that check the test passes while downloading nothing.
+  regardless of resource size. Verified by `tests/test_memory.py`: a 100 MiB download
+  peaks at the same RSS as a 10 MiB one (~38 MB, almost all of it the interpreter),
+  and the test asserts both downloads really transferred their full payload — without
+  that check it passes while downloading nothing.
 - **`--timeout` is an absolute deadline on the whole request.** HTTPX's own timeouts
   are per-phase and its read timeout resets whenever any byte arrives, so a trickling
   server could run arbitrarily long past them (measured: 4.4 s of trickle under a
