@@ -278,3 +278,75 @@ class TestStaleConnectionRetry:
         assert calls["n"] == 1
         assert result.ok is False
         assert "503" in (result.error or "")
+
+
+class TestMidBodyDisconnectIsNotRetried:
+    """P1: a truncating disconnect must fail, not silently become a second attempt.
+
+    The previous retry gate matched exception text ("peer closed"), which a
+    mid-body disconnect also matches - so a truncated transfer could be retried and
+    reported as a success, with an unaccounted physical GET. The gate is now
+    connection state: only an error before the response started is retried.
+    """
+
+    def test_disconnect_after_response_started_is_reported_failed(self) -> None:
+        calls = {"n": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls["n"] += 1
+            if calls["n"] == 1:
+
+                async def truncating():
+                    yield b"half-"
+                    raise httpx.RemoteProtocolError(
+                        "peer closed connection without sending complete message body"
+                    )
+
+                return httpx.Response(200, content=truncating())
+            return resp(200, b"second try")
+
+        transport = transport_for(handler)
+        try:
+            result = fetch(transport, "https://x/y")
+        finally:
+            close(transport)
+        assert result.ok is False
+        assert "peer closed" in (result.error or "") or "RemoteProtocolError" in (
+            result.error or ""
+        )
+        assert result.bytes == 0  # FR-5.2: a truncated transfer contributes nothing
+        assert calls["n"] == 1, "mid-body disconnect must not be retried"
+
+    def test_disconnect_before_response_starts_is_retried_once(self) -> None:
+        calls = {"n": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                # Raised while handling the request: no response has started.
+                raise httpx.ConnectError("connection closed before response")
+            return resp(200, b"recovered")
+
+        transport = transport_for(handler)
+        try:
+            result = fetch(transport, "https://x/y")
+        finally:
+            close(transport)
+        assert result.ok is True
+        assert result.bytes == len(b"recovered")
+        assert calls["n"] == 2
+
+    def test_two_failures_in_a_row_are_not_infinitely_retried(self) -> None:
+        calls = {"n": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls["n"] += 1
+            raise httpx.ConnectError("connection closed before response")
+
+        transport = transport_for(handler)
+        try:
+            result = fetch(transport, "https://x/y")
+        finally:
+            close(transport)
+        assert result.ok is False
+        assert calls["n"] == 2

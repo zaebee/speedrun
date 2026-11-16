@@ -128,7 +128,7 @@ The choices below change the numbers, so they are documented rather than hidden:
   The figure is application-payload throughput, not physical wire utilization.
 - **Volume counts bytes received**, not `Content-Length`. A chunked response has no
   declared length, and a declared length can disagree with what arrives.
-- **Body is read in 256 KiB chunks and discarded**, so peak memory stays constant
+- **Body is streamed in 64 KiB chunks and discarded**, so peak memory stays constant
   regardless of resource size. Verified: downloading a 100 MiB file uses the same
   identical peak RSS (~33 MB, mostly the interpreter) as a 10 MiB one. Measured by
   `tests/test_memory.py`, which also asserts both downloads really transferred their
@@ -178,7 +178,7 @@ onto those tests.
 ## Layout
 
 ```
-speedrun.py        the script (stdlib only)
+speedrun.py        the script (HTTP semantics delegated to HTTPX)
 SPEC.md            requirements, acceptance criteria, design decisions
 tests/             pytest suite
 pyproject.toml     tool configuration (ruff, mypy, pytest markers)

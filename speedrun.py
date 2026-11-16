@@ -295,7 +295,8 @@ class HttpTransport:
       exchange, including body consumption, is what makes --timeout an absolute
       bound (FR-3.5);
     - payload accounting: ``aiter_raw`` with ``Accept-Encoding: identity`` counts
-      bytes as delivered on the wire, before any decoding (FR-2.5, FR-4.3);
+      raw response-body payload bytes, before any content decoding. This excludes
+      headers and transfer framing by definition (FR-2.5, FR-4.3);
     - monotonic timing around the whole exchange (FR-3.1).
 
     One known non-interruptible phase: DNS resolution runs in a worker thread
@@ -365,20 +366,27 @@ class HttpTransport:
     async def _exchange(self, url: str) -> tuple[int, int]:
         """Stream one response to completion; return (payload bytes, final status).
 
-        A stale pooled connection can surface as a protocol error on the first
-        request that touches it - a property of every keep-alive client, not a
-        defect of the resource. It is retried once: counting that failure would
-        report a connection event as the resource's speed (FR-2.3 measurement
-        integrity). Any second failure is this request's outcome.
-        """
-        try:
-            return await self._stream_once(url)
-        except (httpx.RemoteProtocolError, httpx.ConnectError) as exc:
-            if not self._looks_like_stale_connection(exc):
-                raise
-            return await self._stream_once(url)
+        The stale-connection race of every keep-alive client: the server may close
+        an idle connection at any moment, and the failure surfaces on the first
+        request that touches it. That one failure is retried, because counting it
+        would report a connection event as the resource's speed (FR-2.3).
 
-    async def _stream_once(self, url: str) -> tuple[int, int]:
+        The retry is gated on CONNECTION STATE, not exception text: only an error
+        raised before the response started is eligible. A disconnect after the
+        first byte of the body is a truncated transfer and is reported as a failed
+        request - retrying it would silently turn a broken response into a success
+        and add an unaccounted physical GET.
+        """
+        for attempt in (1, 2):
+            response_started = [False]
+            try:
+                return await self._stream_once(url, response_started)
+            except (httpx.RemoteProtocolError, httpx.ConnectError):
+                if response_started[0] or attempt == 2:
+                    raise
+        raise AssertionError("unreachable")
+
+    async def _stream_once(self, url: str, response_started: list[bool]) -> tuple[int, int]:
         client = self._get_client()
         # Per-phase timeouts cap each blocking step at the budget; the absolute
         # bound is asyncio.timeout in fetch(). Without them a stalled step could
@@ -389,22 +397,14 @@ class HttpTransport:
             headers={"Accept-Encoding": "identity"},
             timeout=httpx.Timeout(self.timeout),
         ) as response:
+            # Entering the context means headers were received; from here a
+            # connection failure is a truncated transfer, never a stale idle
+            # connection - the retry gate in _exchange depends on this flag.
+            response_started[0] = True
             size = 0
             async for chunk in response.aiter_raw(chunk_size=_CHUNK):
                 size += len(chunk)
             return size, response.status_code
-
-    @staticmethod
-    def _looks_like_stale_connection(exc: Exception) -> bool:
-        message = str(exc).lower()
-        markers = (
-            "server disconnected",
-            "connection reset",
-            "broken pipe",
-            "peer closed",
-            "closed connection",
-        )
-        return any(marker in message for marker in markers)
 
     def _failure(self, exc: Exception, start: float) -> FetchResult:
         return FetchResult(ok=False, seconds=self.now() - start, bytes=0, error=_reason(exc))
@@ -441,53 +441,42 @@ async def _attempt(transport: Transport, url: str, now: Callable[[], float]) -> 
         return FetchResult(ok=False, seconds=now() - start, bytes=0, error=_reason(exc))
 
 
-async def _collect(
-    transport: Transport, url: str, args: argparse.Namespace
-) -> tuple[list[FetchResult], bool]:
-    """Run requests until done or interrupted; return (results, was_interrupted)."""
-    results: list[FetchResult] = []
-    for index in range(1, args.requests + 1):
-        try:
-            result = await _attempt(transport, url, time.monotonic)
-        except (asyncio.CancelledError, KeyboardInterrupt):
-            # Ctrl-C cancels the enclosing task; whatever was measured so far is
-            # still a measurement and must reach the operator (NFR-4).
-            return results, True
-        results.append(result)
-        if not args.quiet:
-            print(_progress_line(index, args.requests, result))
-        if args.debug and not result.ok:
-            print(f"speedrun: request {index} failed: {result.error}", file=sys.stderr)
-    return results, False
-
-
-async def _arun(
-    url: str,
-    requests: int,
+async def _run_requests(
     transport: Transport,
+    url: str,
+    *,
+    requests: int,
     quiet: bool,
     emit: Emit | None,
-    now: Callable[[], float],
-) -> Summary:
+    debug: bool = False,
+    now: Callable[[], float] = time.monotonic,
+) -> tuple[Summary, bool]:
+    """The one sequential request loop, shared by the CLI and the public API.
+
+    Returns (summary, was_interrupted). Owns the event loop's transport lifetime:
+    connections are released here, in the same loop that made the requests.
+    """
     writer: Emit = emit if emit is not None else print
     results: list[FetchResult] = []
     started = now()
+    interrupted = False
     try:
         for index in range(1, requests + 1):
             try:
                 result = await _attempt(transport, url, now)
             except (asyncio.CancelledError, KeyboardInterrupt):
-                # This loop owns the event loop (see run()), so it also owns
-                # releasing the transport's connections - here, not in some
-                # caller's loop where the client's sockets are already orphaned.
-                await _maybe_aclose(transport)
-                return summarize(results, wall_seconds=now() - started)
+                # Ctrl-C cancels the enclosing task; whatever was measured so far
+                # is still a measurement and must reach the operator (NFR-4).
+                interrupted = True
+                break
             results.append(result)
             if not quiet:
                 writer(_progress_line(index, requests, result))
+            if debug and not result.ok:
+                print(f"speedrun: request {index} failed: {result.error}", file=sys.stderr)
     finally:
         await _maybe_aclose(transport)
-    return summarize(results, wall_seconds=now() - started)
+    return summarize(results, wall_seconds=now() - started), interrupted
 
 
 async def _maybe_aclose(transport: Transport) -> None:
@@ -504,6 +493,7 @@ def run(
     transport: Transport,
     quiet: bool = False,
     emit: Emit | None = None,
+    debug: bool = False,
     now: Callable[[], float] = time.monotonic,
 ) -> Summary:
     """Perform ``requests`` sequential fetches and aggregate the result.
@@ -513,7 +503,12 @@ def run(
     connections are pooled and reused (FR-2.3); across calls it would not be.
     """
     set_deadline(transport, timeout)
-    return asyncio.run(_arun(url, requests, transport, quiet, emit, now))
+    summary, _ = asyncio.run(
+        _run_requests(
+            transport, url, requests=requests, quiet=quiet, emit=emit, debug=debug, now=now
+        )
+    )
+    return summary
 
 
 def set_deadline(transport: Transport, seconds: float) -> None:
@@ -564,16 +559,17 @@ async def _amain(args: argparse.Namespace, transport: Transport | None) -> int:
 
     active: Transport = transport if transport is not None else HttpTransport()
     set_deadline(active, args.timeout)
-    started = time.monotonic()
-    try:
-        results, interrupted = await _collect(active, url, args)
-    finally:
-        # Same loop as the requests: releasing here is what keeps the sockets
-        # reachable for a clean shutdown (NFR-4) instead of orphaning them.
-        await _maybe_aclose(active)
-    wall = time.monotonic() - started
+    # One loop for both entry points: _amain is a thin adapter that adds only the
+    # summary rendering and exit-code decision.
+    summary, interrupted = await _run_requests(
+        active,
+        url,
+        requests=args.requests,
+        quiet=args.quiet,
+        emit=None,
+        debug=args.debug,
+    )
 
-    summary = summarize(results, wall_seconds=wall)
     if not args.quiet:
         print()
     for line in format_summary(summary):
@@ -581,7 +577,8 @@ async def _amain(args: argparse.Namespace, transport: Transport | None) -> int:
 
     if interrupted:
         print(
-            f"\nspeedrun: interrupted after {len(results)} of {args.requests} requests",
+            f"\nspeedrun: interrupted after {summary.ok_count + summary.fail_count} "
+            f"of {args.requests} requests",
             file=sys.stderr,
         )
         return int(ExitCode.INTERRUPTED)

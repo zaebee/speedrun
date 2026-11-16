@@ -84,23 +84,17 @@ Code `2` is kept distinct from `1` on purpose: "invoked wrong" differs from
   populated by `run()` as well as by the CLI: a default of 0.0 is otherwise
   indistinguishable from an instantaneous run, and callers of the library API would
   get a wrong figure while the command line was correct.
-- **FR-3.5.** `--timeout` is a deadline on the *whole* request, and it must bound
-  every blocking step, not selected ones: connection setup, request write, response
-  header read, each body read, and each redirect-body drain. Two implementation facts
-  make this non-trivial, and both are asserted by tests:
-  - Python's socket timeout bounds only the wait between two reads, so it is re-armed
-    to the *remaining* budget before every step. A floor such as `max(0.1, remaining)`
-    is forbidden: it lets an operation block past the deadline and makes the contract
-    advisory. With no budget left, the attempt fails without opening a socket.
-  - `read(n)` on a buffered response waits for a full n bytes, which puts any check
-    between reads out of reach for a slow sender. Reads therefore use `read1`, which
-    returns whatever has arrived. Measured against a local server streaming 2000
-    one-byte writes: `read(65536)` blocked 4.4 s under a 0.6 s deadline; `read1`
-    reached the deadline in 0.60 s.
+- **FR-3.5.** `--timeout` is a deadline on the *whole* request: connection setup,
+  request write, response header read, and body streaming are all inside it. HTTPX's
+  own connect/read/write/pool timeouts cannot provide this - they are per-phase, and
+  the read timeout resets whenever any byte arrives, so a trickling sender could run
+  arbitrarily long past them (measured: a 2000-write trickle ran 4.4 s under a 0.6 s
+  read timeout). The deadline is therefore enforced with `asyncio.timeout` around the
+  entire exchange, including body consumption; HTTPX's per-phase timeouts remain only
+  as a stall guard.
 
-  Explicitly outside the guarantee: DNS resolution (resolver timeouts are not ours)
-  and preempting a single read already in progress. Recorded as `DEADLINE_SCOPE` in
-  the module so the limitation travels with the code rather than only the docs.
+  Explicitly outside the guarantee: DNS resolution runs in a worker thread inside
+  connect - the deadline fires on time, but the resolver thread may linger past it.
 
 ### FR-4. Data volume
 
@@ -185,8 +179,10 @@ in documentation that does not add up is worse than no example.
 - **NFR-4.** Ctrl-C ends the run gracefully: print the summary for requests
   already completed, exit code `130`. A partial measurement beats a lost one.
 - **NFR-5.** Code is typed (`mypy --strict` clean) and linted with `ruff`.
-- **NFR-6.** Networking sits behind a transport interface: the module depends on
-  `Transport.fetch(url, timeout) -> FetchResult`, not on `urllib` directly.
+- **NFR-6.** Networking sits behind a transport interface: orchestration depends on
+  `Transport.fetch(url) -> FetchResult` plus a sync `set_deadline(seconds)`, not on
+  HTTPX directly. The deadline is transport configuration applied before the run
+  starts, which is what keeps timeout parameters out of the async call chain.
   This follows from the verification strategy (section 7): all numeric logic is
   pure functions testable without a network, leaving real HTTP as the single
   unit-untestable part covered by one end-to-end run. Side effect: FR-5.x can be
@@ -237,12 +233,12 @@ Deliberate trade-offs, not forgotten cases.
    provides all of it as supported behaviour; this module keeps only measurement.
    Price: one dependency and its tree (httpcore, anyio, certifi, h11), and an
    event loop per run() call.
-4. **Absolute deadline via asyncio.wait_for, not client timeouts.** HTTPX timeouts
+4. **Absolute deadline via asyncio.timeout, not client timeouts.** HTTPX timeouts
    are per-phase and the read timeout resets on every arrival, so a trickling body is
    unbounded under them (measured: 4.4 s of trickle under a 0.6 s read timeout).
-   wait_for around the whole exchange including body consumption is what makes
-   --timeout absolute. Same non-interruptible phase as before: DNS runs in a worker
-   thread; the deadline fires on time but the resolver may linger.
+   The timeout context manager around the whole exchange, including body consumption,
+   is what makes --timeout absolute. Same non-interruptible phase as before: DNS runs
+   in a worker thread; the deadline fires on time but the resolver may linger.
    Resolution: request `Accept-Encoding: identity` (FR-2.5), so received bytes
    equal the body. `http.client` with manual reads stays a fallback if that ever
    proves unacceptable.
@@ -270,7 +266,7 @@ possible before code exists and asserts something substantive.
 | `validate_url` | http/https accepted, ftp/scheme-less rejected | FR-1.2 |
 | `parse_args` | defaults N=10 and timeout=30, `-n 0` errors | FR-1.3, FR-1.4 |
 | run loop on fake transport | failures do not abort, excluded from stats | FR-5.1-5.3 |
-| `UrllibTransport.fetch` on stubbed response + injected clock | whole-request deadline, partial bytes dropped | FR-3.5, FR-5.2 |
+| transport on stubbed responses | whole-request deadline, partial bytes dropped | FR-3.5, FR-5.2 |
 | `main` with interrupting transport | exit 130 and partial summary preserved | NFR-4, AC-13 |
 | run loop, all requests fail | exit code 1, `0 ok / N failed` | FR-5.6, AC-3 |
 
