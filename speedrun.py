@@ -18,7 +18,7 @@ import statistics
 import sys
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Any, Protocol
 from urllib.parse import urljoin, urlparse
@@ -135,8 +135,13 @@ def throughput(total_bytes: int, total_seconds: float) -> float:
     return total_bytes / total_seconds
 
 
-def summarize(results: Sequence[FetchResult]) -> Summary:
-    """Aggregate a run, excluding failures from average and volume (FR-5.2)."""
+def summarize(results: Sequence[FetchResult], wall_seconds: float = 0.0) -> Summary:
+    """Aggregate a run, excluding failures from average and volume (FR-5.2).
+
+    ``wall_seconds`` is the elapsed time of the whole run, passed in because only
+    the caller can measure it (FR-3.4): deriving it from the request durations
+    would make the overhead metric identically zero by construction.
+    """
     good = [r for r in results if r.ok]
     durations = [r.seconds for r in good]
     total_bytes = sum(r.bytes for r in good)
@@ -149,6 +154,7 @@ def summarize(results: Sequence[FetchResult]) -> Summary:
         avg_seconds=mean(durations),
         median_seconds=median(durations),
         throughput_bytes_per_sec=throughput(total_bytes, total_seconds),
+        wall_seconds=wall_seconds,
     )
 
 
@@ -625,7 +631,7 @@ def main(argv: Sequence[str] | None = None, transport: Transport | None = None) 
         active.close()
     wall = time.monotonic() - started
 
-    summary = replace(summarize(results), wall_seconds=wall)
+    summary = summarize(results, wall_seconds=wall)
     if not args.quiet:
         print()
     for line in format_summary(summary):

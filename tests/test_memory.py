@@ -18,6 +18,8 @@ from pathlib import Path
 
 import pytest
 
+import speedrun
+
 SCRIPT = Path(__file__).resolve().parent.parent / "speedrun.py"
 SMALL = "https://proof.ovh.net/files/10Mb.dat"
 LARGE = "https://proof.ovh.net/files/100Mb.dat"
@@ -60,8 +62,6 @@ class TestConstantMemory:
 
     def test_chunk_size_is_small_relative_to_payload(self) -> None:
         # Structural guard: if someone raises the read chunk to absurd sizes, the
-        # constant-memory property degrades even while tests above still pass.
-        sys.path.insert(0, str(SCRIPT.parent))
-        import speedrun
-
+        # constant-memory property degrades even while the RSS test above still
+        # passes. Imported at module level so no sys.path mutation is needed.
         assert speedrun._CHUNK <= 1024 * 1024

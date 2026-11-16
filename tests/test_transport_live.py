@@ -15,7 +15,7 @@ from local_server import LocalTestServer
 from speedrun import FetchResult, HttpTransport, run
 
 
-@pytest.fixture()
+@pytest.fixture
 def server() -> object:
     with LocalTestServer() as s:
         yield s
@@ -195,3 +195,27 @@ class TestNoErrorEscapesTheTransport:
         summary = run("https://x/y", requests=2, timeout=5.0, transport=Buggy(), quiet=True)
         assert summary.fail_count == 2
         assert summary.ok_count == 0
+
+
+class TestRedirectWithBody:
+    """The case that makes connection draining load-bearing."""
+
+    def test_redirect_carrying_a_body_does_not_break_the_pooled_connection(
+        self, server: LocalTestServer
+    ) -> None:
+        # Without draining, http.client raises ResponseNotReady here; with an empty
+        # redirect body (the /redirect route) the bug is invisible, so this shape
+        # needs its own coverage.
+        transport = HttpTransport()
+        try:
+            first = transport.fetch(f"{server.base_url}/redirect-body", timeout=10.0)
+            second = transport.fetch(f"{server.base_url}/payload=100", timeout=10.0)
+        finally:
+            transport.close()
+        assert first.ok is True
+        # Only the final response's payload counts, not the redirect's 5000 bytes.
+        assert first.bytes == 4096
+        assert second.ok is True
+        assert second.bytes == 100
+        # And both still share one connection.
+        assert server.accepted_connections == 1

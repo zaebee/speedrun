@@ -77,6 +77,21 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     def _serve_redirect(self, _server: LocalTestServer) -> None:
         self._redirect("/final")
 
+    def _serve_redirect_body(self, _server: LocalTestServer) -> None:
+        """A 302 that also carries a body.
+
+        Legal but uncommon, and it is the only shape that exercises connection
+        draining: without consuming the body before the next request on the same
+        socket, http.client raises ResponseNotReady and the attempt fails. A
+        redirect with Content-Length: 0 cannot reveal this, which is why the plain
+        /redirect route does not cover it.
+        """
+        self.send_response(302)
+        self.send_header("Location", "/final")
+        self.send_header("Content-Length", "5000")
+        self.end_headers()
+        self.wfile.write(b"R" * 5000)
+
     def _serve_moved_gone(self, _server: LocalTestServer) -> None:
         # A redirect to a dead resource; the final status must drive the result.
         self._redirect("/missing", permanent=True)
@@ -133,6 +148,7 @@ _ROUTES: tuple[tuple[str, str], ...] = (
     ("/slow-eof", "_serve_slow_eof"),
     ("/stalled", "_serve_stalled"),
     ("/loop", "_serve_loop"),
+    ("/redirect-body", "_serve_redirect_body"),
     ("/redirect", "_serve_redirect"),
     ("/moved-gone", "_serve_moved_gone"),
     ("/gzip", "_serve_gzip"),
