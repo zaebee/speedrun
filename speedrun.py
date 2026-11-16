@@ -312,7 +312,11 @@ class HttpTransport:
     # -- internals ------------------------------------------------------------
 
     def _fetch_one(self, url: str, deadline: float, start: float) -> tuple[FetchResult, str | None]:
-        scheme, host, port, path = _split_url(url)
+        try:
+            scheme, host, port, path = _split_url(url)
+        except ValueError as exc:
+            # A malformed URL is this attempt's failure, not a fatal parse crash.
+            return self._failure(exc, start), None
         if deadline - self.now() <= 0:
             return (
                 FetchResult(
@@ -325,7 +329,9 @@ class HttpTransport:
             )
         try:
             response = self._exchange_resilient(scheme, host, port, path, deadline)
-        except Exception as exc:
+        except (OSError, http.client.HTTPException, ValueError) as exc:
+            # Socket errors, protocol errors and malformed status lines all mean
+            # "this attempt failed", never "stop the run" (FR-5.1).
             return self._failure(exc, start), None
 
         status = int(response.status)
@@ -407,7 +413,7 @@ class HttpTransport:
         """
         try:
             return self._exchange(scheme, host, port, path, deadline)
-        except Exception as exc:
+        except (OSError, http.client.HTTPException, ValueError) as exc:
             dropped = self._drop((host, port))
             if not (dropped and self._is_reusable_error(exc)):
                 raise
@@ -517,8 +523,15 @@ def _attempt(
         return transport.fetch(url, timeout)
     except KeyboardInterrupt:
         raise
-    except Exception as exc:  # any transport failure is one bad request, not fatal
-        return FetchResult(ok=False, seconds=now() - start, bytes=0, error=_reason(exc))
+    except BaseException as exc:
+        # Deliberately broad, and tested to be so: FR-5.1 says one bad request must
+        # never abort a run, which includes failures of our own making (a bug in the
+        # transport raises whatever it likes). Only KeyboardInterrupt is re-raised,
+        # because Ctrl-C is an instruction rather than an outcome.
+        # See TestNoErrorEscapesTheTransport - narrowing this line breaks it.
+        if isinstance(exc, Exception):
+            return FetchResult(ok=False, seconds=now() - start, bytes=0, error=_reason(exc))
+        raise
 
 
 def run(

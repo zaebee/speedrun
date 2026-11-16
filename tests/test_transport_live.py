@@ -12,7 +12,7 @@ from __future__ import annotations
 import pytest
 from local_server import LocalTestServer
 
-from speedrun import HttpTransport, run
+from speedrun import FetchResult, HttpTransport, run
 
 
 @pytest.fixture()
@@ -151,3 +151,47 @@ class TestCloseIsIdempotent:
         transport.fetch(f"{server.base_url}/payload=10", timeout=10.0)
         transport.close()
         transport.close()
+
+
+class TestNoErrorEscapesTheTransport:
+    """FR-5.1: every failure mode must become a FetchResult, never an exception.
+
+    The handlers are deliberately narrower than `except Exception`. This test is
+    the guard against narrowing them too far: it walks the failure modes a socket
+    layer actually produces and asserts none of them propagate.
+    """
+
+    @pytest.mark.parametrize(
+        ("url", "hint"),
+        [
+            ("http://no-such-host-zzz.invalid/x", "gaierror"),
+            ("http://127.0.0.1:1/x", "refused"),
+            ("http://[not-an-ipv6/x", ""),
+        ],
+    )
+    def test_failure_becomes_a_result(self, url: str, hint: str) -> None:
+        transport = HttpTransport()
+        try:
+            result = transport.fetch(url, timeout=2.0)
+        except BaseException as exc:  # pragma: no cover - the assertion below is the point
+            pytest.fail(f"{url} raised {type(exc).__name__}: {exc}")
+        finally:
+            transport.close()
+        assert result.ok is False
+        assert result.error
+        if hint:
+            assert hint in result.error.lower(), result.error
+
+    def test_unexpected_internal_error_is_still_contained_by_the_loop(self) -> None:
+        # A bug inside fetch (not a network error) is caught by _attempt's net, so
+        # one bad request cannot abort a run even when it is our own fault.
+        class Buggy:
+            def fetch(self, url: str, timeout: float) -> FetchResult:
+                raise RuntimeError("bug in transport")
+
+            def close(self) -> None:
+                return None
+
+        summary = run("https://x/y", requests=2, timeout=5.0, transport=Buggy(), quiet=True)
+        assert summary.fail_count == 2
+        assert summary.ok_count == 0

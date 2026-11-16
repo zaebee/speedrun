@@ -16,7 +16,7 @@ import gzip
 import http.server
 import socketserver
 import threading
-from collections.abc import Iterator
+from collections.abc import Callable
 
 
 class _Handler(http.server.BaseHTTPRequestHandler):
@@ -31,107 +31,116 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *_args: object) -> None:  # silence per-request logging
         return None
 
-    def do_GET(self) -> None:
+    def do_GET(self) -> None:  # name fixed by BaseHTTPRequestHandler
         server = self.server
         assert isinstance(server, LocalTestServer)
         server.request_paths.append(self.path)
+        handler = self._route()
+        handler(server)
 
-        if self.path == "/slow-eof":
-            # Body arrives quickly, EOF is delayed past any reasonable deadline:
-            # the case where checking the deadline only after a non-empty read
-            # would wrongly report success.
-            self.send_response(200)
-            self.send_header("Content-Length", "4")
-            self.end_headers()
-            self.wfile.write(b"abcd")
-            self.wfile.flush()
-            server.delay_before_close()
-            return
+    def _route(self) -> Callable[[_Handler, LocalTestServer], None]:
+        """Pick the responder for this path.
 
-        if self.path == "/stalled":
-            # Headers then nothing: exercises the socket timeout, distinct from
-            # the whole-request deadline.
-            self.send_response(200)
-            self.send_header("Content-Length", "1000000")
-            self.end_headers()
-            self.wfile.write(b"x")
-            self.wfile.flush()
-            server.sleep_long()
-            return
+        A table rather than a chain of ifs: each response shape is independent, and
+        an if-ladder here reads as control flow when it is really a lookup.
+        """
+        path = self.path
+        for prefix, name in _ROUTES:
+            if path.startswith(prefix):
+                return getattr(self, name)
+        return self._serve_unknown
 
-        if self.path == "/loop":
-            # Self-redirect: proves the hop limit stops a cycle instead of hanging.
-            self.send_response(302)
-            self.send_header("Location", "/loop")
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-            return
+    # -- responders -----------------------------------------------------------
 
-        if self.path.startswith("/redirect"):
-            self.send_response(302)
-            self.send_header("Location", "/final")
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-            return
+    def _serve_slow_eof(self, server: LocalTestServer) -> None:
+        # Body arrives quickly, EOF is delayed past any reasonable deadline: the
+        # case where checking the deadline only after a non-empty read would
+        # wrongly report success.
+        self._respond(200, b"abcd")
+        self.wfile.flush()
+        server.delay_before_close()
 
-        if self.path == "/moved-gone":
-            # A redirect to a dead resource; final status must drive the result.
-            self.send_response(301)
-            self.send_header("Location", "/missing")
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-            return
-
-        if self.path == "/gzip":
-            payload = gzip.compress(b"z" * 5000)
-            self.send_response(200)
-            self.send_header("Content-Encoding", "gzip")
-            self.send_header("Content-Length", str(len(payload)))
-            self.end_headers()
-            self.wfile.write(payload)
-            return
-
-        if self.path == "/chunked":
-            # No Content-Length at all: proves volume comes from bytes received.
-            self.send_response(200)
-            self.send_header("Transfer-Encoding", "chunked")
-            self.end_headers()
-            for _ in range(4):
-                body = b"y" * 700
-                self.wfile.write(f"{len(body):x}\r\n".encode() + body + b"\r\n")
-            self.wfile.write(b"0\r\n\r\n")
-            return
-
-        if self.path.startswith("/error"):
-            code = int(self.path.split("/error")[1] or 500)
-            self.send_response(code)
-            self.send_header("Content-Length", "5")
-            self.end_headers()
-            self.wfile.write(b"nope!")
-            return
-
-        if self.path.startswith("/payload") or self.path == "/final":
-            # Known paths serve a predictable number of bytes.
-            pass
-        else:
-            # Anything else is genuinely absent. Returning a body for unknown paths
-            # would hide redirect bugs: a 301 to a missing resource must surface as
-            # 404, not as a successful download.
-            self.send_response(404)
-            self.send_header("Content-Length", "9")
-            self.end_headers()
-            self.wfile.write(b"not found")
-            return
-
-        size = int(self.server.query_size(self.path))  # type: ignore[attr-defined]
+    def _serve_stalled(self, server: LocalTestServer) -> None:
+        # Headers then silence: exercises the socket timeout, which is a different
+        # failure from the whole-request deadline.
         self.send_response(200)
-        self.send_header("Content-Length", str(size))
+        self.send_header("Content-Length", "1000000")
         self.end_headers()
-        written = 0
-        while written < size:
-            block = min(65_536, size - written)
-            self.wfile.write(b"a" * block)
-            written += block
+        self.wfile.write(b"x")
+        self.wfile.flush()
+        server.sleep_long()
+
+    def _serve_loop(self, _server: LocalTestServer) -> None:
+        # Self-redirect: proves the hop limit stops a cycle instead of hanging.
+        self._redirect("/loop")
+
+    def _serve_redirect(self, _server: LocalTestServer) -> None:
+        self._redirect("/final")
+
+    def _serve_moved_gone(self, _server: LocalTestServer) -> None:
+        # A redirect to a dead resource; the final status must drive the result.
+        self._redirect("/missing", permanent=True)
+
+    def _serve_gzip(self, _server: LocalTestServer) -> None:
+        payload = gzip.compress(b"z" * 5000)
+        self.send_response(200)
+        self.send_header("Content-Encoding", "gzip")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def _serve_chunked(self, _server: LocalTestServer) -> None:
+        # No Content-Length at all: proves volume comes from bytes received (FR-4.2).
+        self.send_response(200)
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+        for _ in range(4):
+            body = b"y" * 700
+            self.wfile.write(f"{len(body):x}\r\n".encode() + body + b"\r\n")
+        self.wfile.write(b"0\r\n\r\n")
+
+    def _serve_error(self, _server: LocalTestServer) -> None:
+        code = int(self.path.removeprefix("/error") or 500)
+        self._respond(code, b"nope!")
+
+    def _serve_payload(self, server: LocalTestServer) -> None:
+        size = server.query_size(self.path)
+        self._respond(200, b"a" * size)
+
+    def _serve_unknown(self, _server: LocalTestServer) -> None:
+        # Serving a body for unknown paths would hide redirect bugs: a 301 to a
+        # missing resource must surface as 404, not as a successful download.
+        self._respond(404, b"not found")
+
+    # -- helpers --------------------------------------------------------------
+
+    def _respond(self, status: int, body: bytes) -> None:
+        self.send_response(status)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if body:
+            self.wfile.write(body)
+
+    def _redirect(self, location: str, *, permanent: bool = False) -> None:
+        self.send_response(301 if permanent else 302)
+        self.send_header("Location", location)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+
+# Longest prefixes first so "/error404" is not caught by a shorter match.
+_ROUTES: tuple[tuple[str, str], ...] = (
+    ("/slow-eof", "_serve_slow_eof"),
+    ("/stalled", "_serve_stalled"),
+    ("/loop", "_serve_loop"),
+    ("/redirect", "_serve_redirect"),
+    ("/moved-gone", "_serve_moved_gone"),
+    ("/gzip", "_serve_gzip"),
+    ("/chunked", "_serve_chunked"),
+    ("/error", "_serve_error"),
+    ("/payload", "_serve_payload"),
+    ("/final", "_serve_payload"),
+)
 
 
 class LocalTestServer(socketserver.ThreadingTCPServer):
@@ -189,7 +198,3 @@ class LocalTestServer(socketserver.ThreadingTCPServer):
         self.server_close()
         if self._thread is not None:
             self._thread.join(timeout=5)
-
-
-def serve(paths: Iterator[str] | None = None) -> LocalTestServer:
-    return LocalTestServer()
