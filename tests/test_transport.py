@@ -1,270 +1,271 @@
-"""Unit tests for the transport with a scripted clock and a stub connection.
+"""HttpTransport behaviour via HTTPX's supported test transport.
 
-The companion file test_transport_live.py proves the same requirements against a
-real socket; this one proves the deadline arithmetic deterministically, without
-timing dependence. Both matter: the live test shows it works, the scripted test
-shows it works for the right reason and pins edge cases (late EOF) that are hard
-to hit reliably over a real socket.
+The old transport needed 270 lines of scripted-clock, stub-socket tests because it
+implemented HTTP by hand. On HTTPX those details are the library's responsibility
+and are exercised by HTTPX's own test suite; what remains here is OUR contract:
+identity-encoding requests, wire-byte accounting, final-status semantics, the
+absolute deadline, and the single stale-connection retry.
+
+MockTransport is HTTPX's supported extension point - no private internals.
 """
 
 from __future__ import annotations
 
+import asyncio
+import gzip
+
+import httpx
 import pytest
 
-from speedrun import HttpTransport
+from speedrun import _MAX_REDIRECTS, HttpTransport
 
 
-class Clock:
-    """Monotonic fake clock advanced explicitly by the test."""
+def transport_for(handler):
+    """A real HttpTransport whose HTTP layer is HTTPX's MockTransport.
 
-    def __init__(self) -> None:
-        self.t = 0.0
-
-    def __call__(self) -> float:
-        return self.t
-
-    def advance(self, dt: float) -> None:
-        self.t += dt
-
-
-class StubResponse:
-    status = 200
-
-    def __init__(
-        self,
-        chunks: list[bytes],
-        clock: Clock,
-        location: str | None = None,
-        eof_delay: float = 0.0,
-    ) -> None:
-        self.chunks = list(chunks)
-        self.clock = clock
-        self.location = location
-        self.eof_delay = eof_delay
-
-    def getheader(self, name: str) -> str | None:
-        return self.location if name == "Location" else None
-
-    def read(self, _size: int) -> bytes:
-        if self.chunks:
-            return self.chunks.pop(0)
-        # The blocking call that discovers EOF took eof_delay seconds.
-        self.clock.advance(self.eof_delay)
-        return b""
+    The client is configured the way HttpTransport._get_client configures it
+    (follow_redirects, hop limit) so these tests exercise the production contract.
+    """
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        follow_redirects=True,
+        max_redirects=_MAX_REDIRECTS,
+        trust_env=False,
+    )
+    return HttpTransport(_client=client)
 
 
-class StubSocket:
-    """Records every timeout the transport arms, so re-arming is observable.
+def fetch(transport: HttpTransport, url: str, timeout: float = 5.0):
+    return asyncio.run(transport.fetch(url, timeout))
 
-    Without this the deadline logic could call settimeout with the original full
-    value every time and no test would notice - which is exactly the bug found in
-    the real code, where the timeout was being set on the response instead of the
-    connection and therefore did nothing at all.
+
+def close(transport: HttpTransport) -> None:
+    asyncio.run(transport.aclose())
+
+
+def resp(status: int, body: bytes = b"", headers: dict | None = None) -> httpx.Response:
+    """A streaming-capable response for MockTransport.
+
+    Bytes content breaks client.stream() on MockTransport with StreamConsumed - the
+    pre-built byte stream is marked consumed before aiter_raw runs (httpx quirk,
+    verified in isolation). An async-generator body is a real stream and streams.
     """
 
-    def __init__(self) -> None:
-        self.timeouts: list[float] = []
+    async def body_stream():
+        if body:
+            yield body
 
-    def settimeout(self, seconds: float) -> None:
-        self.timeouts.append(seconds)
-
-
-class StubConnection:
-    def __init__(self, responses: list[StubResponse]) -> None:
-        self.responses = list(responses)
-        self.requests: list[tuple[str, str]] = []
-        self.closed = 0
-        self.sock = StubSocket()
-
-    def request(self, method: str, path: str, headers: object = None) -> None:
-        self.requests.append((method, path))
-
-    def getresponse(self) -> StubResponse:
-        return self.responses.pop(0)
-
-    def close(self) -> None:
-        self.closed += 1
+    return httpx.Response(status, content=body_stream(), headers=headers)
 
 
-def build(
-    responses: list[StubResponse], clock: Clock | None = None
-) -> tuple[HttpTransport, Clock, list[StubConnection]]:
-    """Transport whose every new connection replays the given responses.
+def ok_handler(status: int = 200, body: bytes = b"payload"):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return resp(status, body)
 
-    The clock is taken from the first response unless passed explicitly: a
-    response advancing one Clock while the transport reads another silently
-    disables every deadline assertion, and that failure mode looks like a pass.
-    """
-    clk = clock or (responses[0].clock if responses else Clock())
-    made: list[StubConnection] = []
-    pool = list(responses)
-
-    def factory(*args: object, **kwargs: object) -> StubConnection:
-        conn = StubConnection(pool)
-        made.append(conn)
-        return conn
-
-    return HttpTransport(now=clk, conn_factory=factory), clk, made
+    return handler
 
 
-def resp(
-    chunks: list[bytes],
-    clock: Clock,
-    *,
-    status: int = 200,
-    **kw: object,
-) -> StubResponse:
-    r = StubResponse(chunks, clock, **kw)  # type: ignore[arg-type]
-    r.status = status
-    return r
+class TestPayloadAccounting:
+    """FR-2.5 / FR-4.1: counted bytes are the delivered body, decoded never."""
 
-
-class TestBodyAccounting:
-    def test_counts_every_chunk(self) -> None:
-        clk = Clock()
-        transport, _, _ = build([resp([b"a" * 8, b"b" * 8], clk)])
-        result = transport.fetch("https://x/y", timeout=5.0)
+    def test_counts_delivered_bytes(self) -> None:
+        transport = transport_for(ok_handler(body=b"a" * 12345))
+        try:
+            result = fetch(transport, "https://x/file")
+        finally:
+            close(transport)
         assert result.ok is True
-        assert result.bytes == 16
+        assert result.bytes == 12345
 
-    def test_empty_body_succeeds_with_zero_bytes(self) -> None:
-        clk = Clock()
-        transport, _, _ = build([resp([], clk)])
-        assert transport.fetch("https://x/y", 5.0).ok is True
+    def test_requests_identity_encoding(self) -> None:
+        """Without identity, httpx would negotiate compression and the count would
+        depend on the server's choice. Identity pins the exchange (FR-2.5)."""
+        seen: list[httpx.Request] = []
 
-    def test_get_uses_path_and_query(self) -> None:
-        # FR-2.5 relies on our own header set; verify the request line too.
-        clk = Clock()
-        transport, _, made = build([resp([b"x"], clk)])
-        transport.fetch("https://x/a/b?x=1&y=2", timeout=5.0)
-        assert made[0].requests == [("GET", "/a/b?x=1&y=2")]
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request)
+            return resp(200, b"x")
+
+        transport = transport_for(handler)
+        try:
+            fetch(transport, "https://x/y")
+        finally:
+            close(transport)
+        assert seen[0].headers.get("Accept-Encoding") == "identity"
+
+    def test_wire_bytes_are_counted_not_decoded_payload(self) -> None:
+        """FR-4.3: a compressed body counts its compressed size.
+
+        The transport never asks for compression (identity), but if a server sends
+        it anyway, aiter_raw must report what crossed the connection - a decoded
+        count would inflate a link measurement by the compression ratio.
+        """
+        payload = gzip.compress(b"z" * 5000)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return resp(200, payload, headers={"Content-Encoding": "gzip"})
+
+        transport = transport_for(handler)
+        try:
+            result = fetch(transport, "https://x/gzipped")
+        finally:
+            close(transport)
+        assert result.ok is True
+        assert result.bytes == len(payload)
+        assert result.bytes < 5000
 
 
-class TestStatusHandling:
-    @pytest.mark.parametrize("status", [200, 201, 204, 299])
-    def test_2xx_is_success(self, status: int) -> None:
-        clk = Clock()
-        transport, _, _ = build([resp([b"x"], clk, status=status)])
-        assert transport.fetch("https://x/y", 5.0).ok is True
+class TestStatusSemantics:
+    """FR-5.4: non-2xx fails; FR-5.4a: the FINAL response's status decides."""
 
     @pytest.mark.parametrize("status", [400, 404, 500, 503])
-    def test_non_2xx_fails_and_reports_code(self, status: int) -> None:
-        clk = Clock()
-        transport, _, _ = build([resp([b"nope"], clk, status=status)])
-        result = transport.fetch("https://x/y", 5.0)
+    def test_non_2xx_is_a_failed_request(self, status: int) -> None:
+        transport = transport_for(ok_handler(status=status, body=b"nope"))
+        try:
+            result = fetch(transport, "https://x/y")
+        finally:
+            close(transport)
         assert result.ok is False
         assert str(status) in (result.error or "")
         assert result.bytes == 0
 
+    def test_redirect_chain_reaches_the_final_response(self) -> None:
+        hops: list[str] = []
 
-class TestLateEofRegression:
-    """P1-2: EOF discovered after the deadline must not count as success.
+        def handler(request: httpx.Request) -> httpx.Response:
+            hops.append(request.url.path)
+            if request.url.path == "/start":
+                return resp(302, headers={"Location": "/middle"})
+            if request.url.path == "/middle":
+                return resp(301, headers={"Location": "/end"})
+            return resp(200, b"arrived")
 
-    The original loop checked the deadline only after a non-empty chunk, so this
-    exact shape - fast body, late EOF - returned ok=True.
-    """
-
-    def test_late_eof_is_a_missed_deadline(self) -> None:
-        clk = Clock()
-        transport, _, _ = build([resp([b"x" * 10], clk, eof_delay=3.0)])
-        result = transport.fetch("https://h/p", timeout=2.0)
-        assert result.ok is False
-        assert "deadline" in (result.error or "")
-
-    def test_partial_bytes_excluded_on_late_eof(self) -> None:
-        # FR-5.2: an aborted transfer contributes no volume.
-        clk = Clock()
-        transport, _, _ = build([resp([b"x" * 10], clk, eof_delay=3.0)])
-        assert transport.fetch("https://h/p", timeout=2.0).bytes == 0
-
-    def test_duration_reflects_the_wait(self) -> None:
-        # P2-4 adjacent: timing must be real, not fabricated.
-        clk = Clock()
-        transport, _, _ = build([resp([b"x" * 10], clk, eof_delay=3.0)])
-        assert transport.fetch("https://h/p", timeout=2.0).seconds == pytest.approx(3.0, abs=0.01)
-
-    def test_ontime_completion_still_succeeds(self) -> None:
-        clk = Clock()
-        transport, _, _ = build([resp([b"x" * 10], clk, eof_delay=0.0)])
-        assert transport.fetch("https://h/p", timeout=2.0).ok is True
-
-
-class TestRedirects:
-    def test_location_header_is_followed_to_absolute_url(self) -> None:
-        clk = Clock()
-        transport, _, made = build(
-            [resp([], clk, status=302, location="/final"), resp([b"body"], clk)]
-        )
-        result = transport.fetch("http://h/start", timeout=5.0)
+        transport = transport_for(handler)
+        try:
+            result = fetch(transport, "https://x/start")
+        finally:
+            close(transport)
         assert result.ok is True
-        assert [p for _, p in made[0].requests] == ["/start", "/final"]
+        assert result.bytes == len(b"arrived")
+        assert hops == ["/start", "/middle", "/end"]
 
-    def test_final_status_decides_success(self) -> None:
-        # FR-5.4a: a redirect ending in 404 is a failure, not a 3xx.
-        clk = Clock()
-        transport, _, _ = build(
-            [resp([], clk, status=301, location="/gone"), resp([b"x"], clk, status=404)]
-        )
-        result = transport.fetch("http://h/a", timeout=5.0)
+    def test_redirect_ending_in_404_is_a_failure(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/gone":
+                return resp(301, headers={"Location": "/missing"})
+            return resp(404, b"absent")
+
+        transport = transport_for(handler)
+        try:
+            result = fetch(transport, "https://x/gone")
+        finally:
+            close(transport)
         assert result.ok is False
         assert "404" in (result.error or "")
 
+    def test_redirect_loop_is_bounded(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return resp(302, headers={"Location": "/loop"})
+
+        transport = transport_for(handler)
+        try:
+            result = fetch(transport, "https://x/loop")
+        finally:
+            close(transport)
+        assert result.ok is False
+        assert "redirect" in (result.error or "")
+
+
+class TestAbsoluteDeadline:
+    """FR-3.5: wait_for bounds the entire exchange, not per-phase waits."""
+
+    def test_slow_streaming_body_hits_the_deadline(self) -> None:
+        """A trickling sender is the case per-phase timeouts cannot bound."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            async def trickle():
+                for _ in range(100):
+                    yield b"x"
+                    await asyncio.sleep(0.05)
+
+            return (
+                resp(
+                    200,
+                    b"",
+                )
+                if False
+                else httpx.Response(200, content=trickle())
+            )
+
+        transport = transport_for(handler)
+        try:
+            result = fetch(transport, "https://x/slow", timeout=0.3)
+        finally:
+            close(transport)
+        assert result.ok is False
+        assert "deadline" in (result.error or "")
+        assert result.seconds < 0.9  # the uninterrupted trickle would take ~5 s
+
+    def test_negative_timeout_fails_without_sending(self) -> None:
+        """An already-expired budget must fail without issuing a request."""
+        sent: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            sent.append(request)
+            return resp(200)
+
+        transport = transport_for(handler)
+        try:
+            result = fetch(transport, "https://x/y", timeout=-1.0)
+        finally:
+            close(transport)
+        assert result.ok is False
+        assert "deadline" in (result.error or "")
+        assert sent == []
+
+    def test_dns_failure_is_a_failed_request_not_a_crash(self) -> None:
+        # Real socket layer (no mock): a name that cannot resolve.
+        transport = HttpTransport()
+        try:
+            result = fetch(transport, "https://no-such-host-zzz.invalid/x", timeout=2.0)
+        finally:
+            close(transport)
+        assert result.ok is False
+        assert result.error
+
 
 class TestStaleConnectionRetry:
-    """Keep-alive race: a server-closed idle connection must not fail the run."""
+    """A keep-alive race is not a measurement of the resource (FR-2.3)."""
 
-    def test_remote_disconnected_retries_once_and_succeeds(self) -> None:
-        import http.client
-
-        clk = Clock()
-        attempts = {"n": 0}
-
-        class FlakyConn:
-            def request(self, method: str, path: str, headers: object = None) -> None:
-                attempts["n"] += 1
-                if attempts["n"] == 1:
-                    raise http.client.RemoteDisconnected("closed by server")
-
-            def getresponse(self) -> StubResponse:
-                return StubResponse([b"payload"], clk)
-
-            def close(self) -> None:
-                return None
-
-        made: list[FlakyConn] = []
-
-        def factory(*a: object, **k: object) -> FlakyConn:
-            c = FlakyConn()
-            made.append(c)
-            return c
-
-        transport = HttpTransport(now=clk, conn_factory=factory)
-        result = transport.fetch("https://h/p", timeout=5.0)
-        assert result.ok is True
-        assert result.bytes == 7
-        # The stale connection was dropped and a fresh one opened.
-        assert len(made) == 2
-
-    def test_non_staleness_error_is_not_retried(self) -> None:
-        # A DNS failure must surface as this request's outcome, not be retried.
-        clk = Clock()
+    def test_one_disconnection_that_looks_stale_is_retried(self) -> None:
         calls = {"n": 0}
 
-        class BadConn:
-            def request(self, method: str, path: str, headers: object = None) -> None:
-                calls["n"] += 1
-                raise OSError("name or service not known")
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise httpx.ConnectError("server disconnected")
+            return resp(200, b"second try")
 
-            def getresponse(self) -> StubResponse:  # pragma: no cover - unreachable
-                raise AssertionError
+        transport = transport_for(handler)
+        try:
+            result = fetch(transport, "https://x/y")
+        finally:
+            close(transport)
+        assert result.ok is True
+        assert calls["n"] == 2
 
-            def close(self) -> None:
-                return None
+    def test_genuine_server_errors_are_not_retried(self) -> None:
+        calls = {"n": 0}
 
-        transport = HttpTransport(
-            now=clk,
-            conn_factory=lambda *a, **k: BadConn(),  # type: ignore[arg-type]
-        )
-        result = transport.fetch("https://h/p", timeout=5.0)
-        assert result.ok is False
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls["n"] += 1
+            return resp(503, b"overloaded")
+
+        transport = transport_for(handler)
+        try:
+            result = fetch(transport, "https://x/y")
+        finally:
+            close(transport)
         assert calls["n"] == 1
+        assert result.ok is False
+        assert "503" in (result.error or "")

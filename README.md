@@ -25,8 +25,16 @@ Throughput     16.10 MiB/s   (135.06 Mbps)
 
 ## Requirements
 
-Python 3.10 or newer. **No third-party dependencies** — standard library only, so
-there is nothing to install.
+Python 3.10 or newer, plus [HTTPX](https://www.python-httpx.org) — the only runtime
+dependency, and it owns the HTTP semantics (connections, redirects, decoding) while
+the script owns measurement:
+
+```console
+pip install httpx
+# or: pip install -e .
+```
+
+Everything else is standard library.
 
 ## Usage
 
@@ -108,13 +116,11 @@ The choices below change the numbers, so they are documented rather than hidden:
 
 - **Sequential, never concurrent.** Request *k+1* starts after *k* has been read to
   completion. This measures single-stream throughput, not server capacity.
-- **One persistent connection per host (HTTP/1.1 keep-alive).** Without it every
-  sample includes a fresh TCP handshake — and over HTTPS a TLS one — so the result
-  describes connection setup rather than transfer. This is why the transport is built
-  on `http.client` directly: `urllib.request` sets `Connection: close` and cannot
-  reuse connections at all. Measured effect on a 10 MiB file: first request 0.62 s,
-  subsequent ones 0.16 s. Consequence to keep in mind — these numbers are better than
-  cold-start downloads would be.
+- **One persistent connection per host (HTTP/1.1 keep-alive), provided by HTTPX.**
+  Without it every sample includes a fresh TCP handshake — and over HTTPS a TLS one —
+  so the result describes connection setup rather than transfer. Measured effect on a
+  10 MiB file: first request 0.62 s, subsequent ones 0.16 s. Consequence to keep in
+  mind — these numbers are better than cold-start downloads would be.
 - **Responses are requested uncompressed** (`Accept-Encoding: identity`), so the
   counted volume is the response body exactly as delivered, with no decoding step
   in between. Note what that volume is *not*: it counts HTTP payload bytes only, so
@@ -127,13 +133,15 @@ The choices below change the numbers, so they are documented rather than hidden:
   identical peak RSS (~33 MB, mostly the interpreter) as a 10 MiB one. Measured by
   `tests/test_memory.py`, which also asserts both downloads really transferred their
   full payload — without that check the test passes while downloading nothing.
-- **`--timeout` bounds the whole request.** The deadline is re-armed to the time
-  actually left before every blocking step — connect, request write, response headers,
-  each body read, each redirect drain — because a timeout set once at connect time is
-  not a whole-request bound. Body reads use `read1()` rather than `read(n)`: the latter
-  waits for a full buffer, which puts the between-read checks out of reach for a slow
-  sender. Not covered: DNS resolution (resolver timeouts are not ours) and preempting a
-  single read already in progress.
+- **`--timeout` is an absolute deadline on the whole request.** HTTPX's own timeouts
+  are per-phase and its read timeout resets whenever any byte arrives, so a trickling
+  server could run arbitrarily long past them (measured: 4.4 s of trickle under a
+  0.6 s read timeout). The deadline is therefore enforced with `asyncio.wait_for`
+  around the entire exchange, including body consumption. Not covered: DNS resolution
+  (resolver timeouts are not ours); the deadline fires on time, but a resolver thread
+  may linger.
+- **Environment proxies are ignored** (`trust_env=False`): a developer's
+  `http_proxy` must not redirect what the measurement actually connects to.
 - **Redirects are followed** (up to 5 hops) and the *final* response status decides
   success. A redirect ending in 404 fails; a CDN answering with a 302 in front of its
   asset measures normally. The hop limit stops a self-referential `Location`.

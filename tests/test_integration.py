@@ -31,22 +31,14 @@ def _online() -> bool:
 @pytest.mark.skipif(not _online(), reason="no network access")
 class TestAgainstRealHost:
     def test_two_requests_download_the_whole_file_each(self) -> None:
-        transport = HttpTransport()
-        try:
-            summary = run(URL, requests=2, timeout=30.0, transport=transport, quiet=True)
-        finally:
-            transport.close()
+        summary = run(URL, requests=2, timeout=30.0, transport=HttpTransport(), quiet=True)
         assert summary.ok_count == 2
         # AC-11: measured volume matches the file's known size within 1%.
         assert summary.total_bytes == pytest.approx(2 * KNOWN_BYTES, rel=0.01)
 
     def test_summary_numbers_reconcile(self) -> None:
         # AC-12: throughput must equal total_bytes / sum of successful durations.
-        transport = HttpTransport()
-        try:
-            summary = run(URL, requests=2, timeout=30.0, transport=transport, quiet=True)
-        finally:
-            transport.close()
+        summary = run(URL, requests=2, timeout=30.0, transport=HttpTransport(), quiet=True)
         expected = summary.total_bytes / summary.total_seconds
         assert summary.throughput_bytes_per_sec == pytest.approx(expected, rel=1e-9)
 
@@ -60,13 +52,10 @@ class TestAgainstRealHost:
             def __init__(self, inner: HttpTransport) -> None:
                 self.inner = inner
 
-            def fetch(self, url: str, timeout: float) -> FetchResult:
-                r = self.inner.fetch(url, timeout)
+            async def fetch(self, url: str, timeout: float) -> FetchResult:
+                r = await self.inner.fetch(url, timeout)
                 results.append(r)
                 return r
-
-            def close(self) -> None:
-                self.inner.close()
 
         run(URL, requests=4, timeout=30.0, transport=Recording(HttpTransport()), quiet=True)
         assert len(results) == 4
@@ -77,17 +66,13 @@ class TestAgainstRealHost:
 
     def test_http_error_status_is_reported_not_raised(self) -> None:
         # AC-3 on a live host.
-        transport = HttpTransport()
-        try:
-            summary = run(
-                "https://proof.ovh.net/definitely-not-here",
-                requests=1,
-                timeout=30.0,
-                transport=transport,
-                quiet=True,
-            )
-        finally:
-            transport.close()
+        summary = run(
+            "https://proof.ovh.net/definitely-not-here",
+            requests=1,
+            timeout=30.0,
+            transport=HttpTransport(),
+            quiet=True,
+        )
         assert summary.fail_count == 1
         assert summary.total_bytes == 0
 
@@ -99,9 +84,5 @@ def test_identity_encoding_means_no_decoding_gap() -> None:
     request = urllib.request.Request(URL, headers={"Accept-Encoding": "identity"})
     with urllib.request.urlopen(request, timeout=30) as response:
         direct = len(response.read())
-    transport = HttpTransport()
-    try:
-        summary = run(URL, requests=1, timeout=30.0, transport=transport, quiet=True)
-    finally:
-        transport.close()
+    summary = run(URL, requests=1, timeout=30.0, transport=HttpTransport(), quiet=True)
     assert summary.total_bytes == direct

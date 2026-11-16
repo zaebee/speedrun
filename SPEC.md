@@ -170,10 +170,13 @@ in documentation that does not add up is worse than no example.
 
 ## 3. Non-functional requirements
 
-- **NFR-1.** Python >= 3.10, standard library only. For a ~150-line script an
-  external dependency is needless risk in someone else's environment and an
-  extra install step in the run instructions. Implementation uses
-  `urllib.request`; see open decision 1 for the price paid.
+- **NFR-1. Python >= 3.10 with HTTPX as the single runtime dependency
+  (revised - owner approval recorded in the PR).** The transport was originally
+  stdlib-only on `http.client`; implementing keep-alive, redirect chains and an
+  absolute request deadline by hand grew to 38% of the production code and produced
+  defects of its own (a socket timeout armed on the wrong object, silently doing
+  nothing). HTTPX owns HTTP semantics; this module owns measurement. See section 6,
+  open decision 4.
 - **NFR-2.** Constant memory: response bodies are not accumulated (FR-2.2), so
   peak RSS is independent of resource size.
 - **NFR-3.** The measurement method and its limits are documented in the README:
@@ -227,10 +230,19 @@ by a factor, not by a percentage.
 
 Deliberate trade-offs, not forgotten cases.
 
-1. **stdlib instead of `requests`.** Price: `urllib.request` cannot report an
-   undecoded body for a gzip response - `read()` returns inflated data - and it also
-   forces `Connection: close`, so it cannot keep a session alive at all. Both are why
-   the transport is built on `http.client` directly.
+1. **stdlib-only was dropped in favour of HTTPX** (supersedes the original decision).
+   The hand-rolled `http.client` transport cost ~300 lines - pooling, redirect hops,
+   stale-connection retry, socket re-arming, drain - and still shipped two real bugs
+   (a no-op socket timeout and a deadline that trickle streams could outrun). HTTPX
+   provides all of it as supported behaviour; this module keeps only measurement.
+   Price: one dependency and its tree (httpcore, anyio, certifi, h11), and an
+   event loop per run() call.
+4. **Absolute deadline via asyncio.wait_for, not client timeouts.** HTTPX timeouts
+   are per-phase and the read timeout resets on every arrival, so a trickling body is
+   unbounded under them (measured: 4.4 s of trickle under a 0.6 s read timeout).
+   wait_for around the whole exchange including body consumption is what makes
+   --timeout absolute. Same non-interruptible phase as before: DNS runs in a worker
+   thread; the deadline fires on time but the resolver may linger.
    Resolution: request `Accept-Encoding: identity` (FR-2.5), so received bytes
    equal the body. `http.client` with manual reads stays a fallback if that ever
    proves unacceptable.
@@ -270,5 +282,4 @@ what a mock cannot: FR-2.2 (body read to end) and FR-2.3 (keep-alive).
 hand division) - these verify agreement with reality, not code correctness.
 
 Tests are not required by the brief but ship in the repo: `pytest` runs with one
-command, their only dependency is pytest itself, and the script remains
-dependency-free (NFR-1).
+command. Test-only dependency: pytest. Runtime dependency: HTTPX (NFR-1, revised).

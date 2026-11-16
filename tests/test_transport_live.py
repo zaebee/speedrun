@@ -1,13 +1,18 @@
-"""Tests for the transport against a local HTTP server we control.
+"""Transport behaviour against a local HTTP server we control.
 
-These replace assertions that could not be made against a fake response object or
-a remote host: connection reuse (counted at the socket level), redirect semantics,
-the whole-request deadline including late EOF, and constant-memory reads.
+Only what needs real sockets lives here: connection-reuse counting, deadline
+enforcement on each blocking phase over actual TCP, and pool recovery after an
+abandoned transfer. Status codes, redirects and byte accounting are covered by
+test_transport.py through HTTPX's MockTransport.
 
-Everything here runs offline and deterministically - no remote latency involved.
+Everything here runs offline and deterministically.
 """
 
 from __future__ import annotations
+
+import asyncio
+import time
+from dataclasses import dataclass
 
 import pytest
 from local_server import LocalTestServer
@@ -15,8 +20,32 @@ from local_server import LocalTestServer
 from speedrun import FetchResult, HttpTransport, run
 
 
+@dataclass
+class Measured:
+    """A fetch result plus the wall time the fetch took, from the same loop."""
+
+    result: FetchResult
+    elapsed: float
+
+
+def fetch_measured(url: str, timeout: float) -> Measured:
+    """One fetch in its own loop, timing it there; the loop owns the transport."""
+
+    async def run_one() -> Measured:
+        transport = HttpTransport()
+        started = time.monotonic()
+        try:
+            result = await transport.fetch(url, timeout)
+            elapsed = time.monotonic() - started
+            return Measured(result=result, elapsed=elapsed)
+        finally:
+            await transport.aclose()
+
+    return asyncio.run(run_one())
+
+
 @pytest.fixture
-def server() -> object:
+def server() -> LocalTestServer:
     with LocalTestServer() as s:
         yield s
 
@@ -24,268 +53,87 @@ def server() -> object:
 class TestConnectionReuse:
     """FR-2.3: the claim is about sockets, so it is verified by counting sockets.
 
-    Comparing request durations cannot prove this; accepted-connection counts can.
-    urllib.request fails this test by construction (it sends Connection: close).
+    Comparing request durations cannot prove reuse; accepted-connection counts
+    can. run() owns the loop and closes the transport itself - closing it from
+    outside would be a second loop, where the client's sockets are orphaned.
     """
 
     def test_four_requests_use_one_connection(self, server: LocalTestServer) -> None:
         transport = HttpTransport()
-        try:
-            summary = run(
-                f"{server.base_url}/payload=2000",
-                requests=4,
-                timeout=10.0,
-                transport=transport,
-                quiet=True,
-            )
-        finally:
-            transport.close()
+        summary = run(
+            f"{server.base_url}/payload=2000",
+            requests=4,
+            timeout=10.0,
+            transport=transport,
+            quiet=True,
+        )
         assert summary.ok_count == 4
         assert len(server.request_paths) == 4
         assert server.accepted_connections == 1
 
 
-class TestRedirects:
-    """FR-5.4a: success is decided by the final response status."""
-
-    def test_redirect_to_ok_is_success(self, server: LocalTestServer) -> None:
-        transport = HttpTransport()
-        try:
-            result = transport.fetch(f"{server.base_url}/redirect", timeout=10.0)
-        finally:
-            transport.close()
-        assert result.ok is True
-        assert result.bytes > 0
-        assert "/final" in server.request_paths
-
-    def test_redirect_to_missing_is_failure_with_final_status(
-        self, server: LocalTestServer
-    ) -> None:
-        transport = HttpTransport()
-        try:
-            result = transport.fetch(f"{server.base_url}/moved-gone", timeout=10.0)
-        finally:
-            transport.close()
-        assert result.ok is False
-        assert "404" in (result.error or "") or "missing" in (result.error or "").lower()
-
-    def test_redirect_loop_is_bounded_not_hanging(self, server: LocalTestServer) -> None:
-        # /loop redirects to itself; the hop limit must stop it.
-        transport = HttpTransport()
-        try:
-            result = transport.fetch(f"{server.base_url}/loop", timeout=10.0)
-        finally:
-            transport.close()
-        assert result.ok is False
-        assert len([p for p in server.request_paths if p == "/loop"]) <= 6
-
-
-class TestErrorStatuses:
-    @pytest.mark.parametrize("code", [400, 404, 500])
-    def test_non_2xx_fails_without_raising(self, server: LocalTestServer, code: int) -> None:
-        transport = HttpTransport()
-        try:
-            result = transport.fetch(f"{server.base_url}/error{code}", timeout=10.0)
-        finally:
-            transport.close()
-        assert result.ok is False
-        assert str(code) in (result.error or "")
-        assert result.bytes == 0
-
-
-class TestChunkedTransfer:
-    def test_volume_comes_from_received_bytes_not_content_length(
-        self, server: LocalTestServer
-    ) -> None:
-        # /chunked sends no Content-Length at all (FR-4.2).
-        transport = HttpTransport()
-        try:
-            result = transport.fetch(f"{server.base_url}/chunked", timeout=10.0)
-        finally:
-            transport.close()
-        assert result.ok is True
-        assert result.bytes == 2800
-
-
 class TestDeadlineAgainstRealSocket:
-    """FR-3.5 exercised over a real blocking read, not a scripted clock."""
+    """FR-3.5 over real sockets: every blocking phase, not just body reads."""
 
     def test_stalled_body_hits_the_deadline(self, server: LocalTestServer) -> None:
-        transport = HttpTransport()
-        try:
-            result = transport.fetch(f"{server.base_url}/stalled", timeout=0.4)
-        finally:
-            transport.close()
-        assert result.ok is False
-        assert result.bytes == 0
+        measured = fetch_measured(f"{server.base_url}/stalled", 0.4)
+        assert measured.result.ok is False
+        assert measured.result.bytes == 0
 
-    def test_socket_reusable_after_a_deadline_miss(self, server: LocalTestServer) -> None:
-        # After abandoning a stalled read the pooled connection is unusable; the
-        # next request must transparently open a fresh one instead of failing.
-        transport = HttpTransport()
-        try:
-            bad = transport.fetch(f"{server.base_url}/stalled", timeout=0.4)
-            good = transport.fetch(f"{server.base_url}/payload=1000", timeout=10.0)
-        finally:
-            transport.close()
+    def test_slow_response_headers_are_bounded(self, server: LocalTestServer) -> None:
+        measured = fetch_measured(f"{server.base_url}/slow-headers", 0.4)
+        # Server delays 2 s before the status line; the deadline must cut the
+        # attempt near 0.4 s, not wait out the 2 s.
+        assert measured.result.ok is False
+        assert measured.elapsed < 1.2, (
+            f"header phase outlived the deadline: {measured.elapsed:.2f}s"
+        )
+
+    def test_trickling_redirect_body_is_bounded(self, server: LocalTestServer) -> None:
+        # The exchange alone would run ~4 s (2000 writes x 2 ms); it must stop on
+        # budget.
+        measured = fetch_measured(f"{server.base_url}/trickle-redirect", 0.6)
+        assert measured.result.ok is False
+        assert measured.elapsed < 1.5, f"exchange outlived the deadline: {measured.elapsed:.2f}s"
+
+    def test_pool_reusable_after_a_deadline_miss(self, server: LocalTestServer) -> None:
+        """After abandoning a stalled transfer the next request must still succeed."""
+
+        async def fetch_both() -> tuple[FetchResult, FetchResult]:
+            transport = HttpTransport()
+            try:
+                bad = await transport.fetch(f"{server.base_url}/stalled", 0.4)
+                good = await transport.fetch(f"{server.base_url}/payload=1000", 10.0)
+                return bad, good
+            finally:
+                await transport.aclose()
+
+        bad, good = asyncio.run(fetch_both())
         assert bad.ok is False
         assert good.ok is True
         assert good.bytes == 1000
 
 
-class TestUnreachableHost:
+class TestFailureIsolation:
+    """FR-5.1: one bad request never aborts a run, whatever the failure."""
+
     def test_dns_failure_is_a_result_not_an_exception(self) -> None:
-        transport = HttpTransport()
-        try:
-            result = transport.fetch("http://no-such-host-zzz.invalid/x", timeout=2.0)
-        finally:
-            transport.close()
-        assert result.ok is False
-        assert result.seconds >= 0  # measured, not fabricated (FR-3.1)
-        assert result.error
+        measured = fetch_measured("http://no-such-host-zzz.invalid/x", 2.0)
+        assert measured.result.ok is False
+        assert measured.result.seconds >= 0  # measured, not fabricated (FR-3.1)
+        assert measured.result.error
 
+    def test_refused_connection_is_a_result_not_an_exception(self) -> None:
+        # Port 1 on loopback: nothing listens there.
+        measured = fetch_measured("http://127.0.0.1:1/x", 2.0)
+        assert measured.result.ok is False
+        assert measured.result.error
 
-class TestCloseIsIdempotent:
-    def test_double_close_does_not_raise(self, server: LocalTestServer) -> None:
-        transport = HttpTransport()
-        transport.fetch(f"{server.base_url}/payload=10", timeout=10.0)
-        transport.close()
-        transport.close()
-
-
-class TestNoErrorEscapesTheTransport:
-    """FR-5.1: every failure mode must become a FetchResult, never an exception.
-
-    The handlers are deliberately narrower than `except Exception`. This test is
-    the guard against narrowing them too far: it walks the failure modes a socket
-    layer actually produces and asserts none of them propagate.
-    """
-
-    @pytest.mark.parametrize(
-        ("url", "hint"),
-        [
-            ("http://no-such-host-zzz.invalid/x", "gaierror"),
-            ("http://127.0.0.1:1/x", "refused"),
-            ("http://[not-an-ipv6/x", ""),
-        ],
-    )
-    def test_failure_becomes_a_result(self, url: str, hint: str) -> None:
-        transport = HttpTransport()
-        try:
-            result = transport.fetch(url, timeout=2.0)
-        except BaseException as exc:  # pragma: no cover - the assertion below is the point
-            pytest.fail(f"{url} raised {type(exc).__name__}: {exc}")
-        finally:
-            transport.close()
-        assert result.ok is False
-        assert result.error
-        if hint:
-            assert hint in result.error.lower(), result.error
-
-    def test_unexpected_internal_error_is_still_contained_by_the_loop(self) -> None:
-        # A bug inside fetch (not a network error) is caught by _attempt's net, so
-        # one bad request cannot abort a run even when it is our own fault.
+    def test_run_survives_a_transport_that_raises_arbitrarily(self) -> None:
         class Buggy:
-            def fetch(self, url: str, timeout: float) -> FetchResult:
+            async def fetch(self, url: str, timeout: float) -> FetchResult:
                 raise RuntimeError("bug in transport")
-
-            def close(self) -> None:
-                return None
 
         summary = run("https://x/y", requests=2, timeout=5.0, transport=Buggy(), quiet=True)
         assert summary.fail_count == 2
         assert summary.ok_count == 0
-
-
-class TestRedirectWithBody:
-    """The case that makes connection draining load-bearing."""
-
-    def test_redirect_carrying_a_body_does_not_break_the_pooled_connection(
-        self, server: LocalTestServer
-    ) -> None:
-        # Without draining, http.client raises ResponseNotReady here; with an empty
-        # redirect body (the /redirect route) the bug is invisible, so this shape
-        # needs its own coverage.
-        transport = HttpTransport()
-        try:
-            first = transport.fetch(f"{server.base_url}/redirect-body", timeout=10.0)
-            second = transport.fetch(f"{server.base_url}/payload=100", timeout=10.0)
-        finally:
-            transport.close()
-        assert first.ok is True
-        # Only the final response's payload counts, not the redirect's 5000 bytes.
-        assert first.bytes == 4096
-        assert second.ok is True
-        assert second.bytes == 100
-        # And both still share one connection.
-        assert server.accepted_connections == 1
-
-
-class TestDeadlineCoversEveryPhase:
-    """FR-3.5: the deadline bounds connect, request write, header read, body read
-    and redirect drain - not only the phases that happened to be checked.
-
-    Each case sets a short timeout against a server phase that would take longer,
-    and asserts both the outcome (failed) and the timing (stopped near the
-    deadline rather than after the phase completed).
-    """
-
-    def test_slow_response_headers_are_bounded(self, server: LocalTestServer) -> None:
-        import time
-
-        transport = HttpTransport()
-        started = time.monotonic()
-        try:
-            result = transport.fetch(f"{server.base_url}/slow-headers", timeout=0.4)
-        finally:
-            transport.close()
-        elapsed = time.monotonic() - started
-        assert result.ok is False
-        # Server delays 2 s before headers; the deadline must cut it near 0.4 s.
-        assert elapsed < 1.2, f"header phase outlived the deadline: {elapsed:.2f}s"
-
-    def test_trickle_drain_stops_at_the_deadline_between_reads(
-        self, server: LocalTestServer
-    ) -> None:
-        """Draining checks the deadline before each read; it cannot abort one in flight.
-
-        The body arrives as 2000 single-byte writes, so there are thousands of
-        decision points and the loop stops close to the budget. A hard cap on a
-        single blocking read is explicitly out of scope (DEADLINE_SCOPE).
-        """
-        import time
-
-        transport = HttpTransport()
-        started = time.monotonic()
-        try:
-            result = transport.fetch(f"{server.base_url}/trickle-redirect", timeout=0.6)
-        finally:
-            transport.close()
-        elapsed = time.monotonic() - started
-        assert elapsed < 1.5, f"drain ignored the deadline between reads: {elapsed:.2f}s"
-        assert result.ok is False or result.bytes == 0
-
-    def test_no_budget_left_opens_no_socket(self, server: LocalTestServer) -> None:
-        """An attempt starting past its deadline must not touch the network.
-
-        Driven through _fetch_one with an explicit deadline rather than through
-        fetch(timeout=...): fetch computes deadline = now() + timeout, so with any
-        clock there is always exactly `timeout` of budget left and "already expired"
-        cannot be expressed at all. A deadline in the past is what a second redirect
-        hop after a slow first hop actually looks like.
-
-        An earlier max(0.1, remaining) clamp would have opened a socket here and been
-        willing to block 100 ms past the deadline.
-        """
-        accepted_before = server.accepted_connections
-        transport = HttpTransport(now=lambda: 50.0)
-        try:
-            result, redirect = transport._fetch_one(
-                f"{server.base_url}/payload=10", deadline=1.0, start=0.0
-            )
-        finally:
-            transport.close()
-        assert result.ok is False
-        assert "deadline" in (result.error or "")
-        assert redirect is None
-        assert server.accepted_connections == accepted_before

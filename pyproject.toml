@@ -3,7 +3,9 @@ name = "speedrun"
 version = "1.0.0"
 description = "Console download-speed probe: sequential requests, measured throughput."
 requires-python = ">=3.10"
-dependencies = []  # The script itself is stdlib-only (SPEC NFR-1).
+dependencies = [
+    "httpx>=0.27",  # HTTP semantics delegated to HTTPX (SPEC NFR-1, revised)
+]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
