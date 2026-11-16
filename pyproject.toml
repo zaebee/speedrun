@@ -1,0 +1,24 @@
+[project]
+name = "speedrun"
+version = "1.0.0"
+description = "Console download-speed probe: sequential requests, measured throughput."
+requires-python = ">=3.10"
+dependencies = []  # The script itself is stdlib-only (SPEC NFR-1).
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+markers = [
+    "network: hits a real remote URL; skipped when offline",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.mypy]
+strict = true
+python_version = "3.10"
